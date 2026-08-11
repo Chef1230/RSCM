@@ -366,12 +366,15 @@ task:
   mechanism_weights:
     relation_attribute: 0.35
     entity_future_event_existence: 0.25
-    # 仅包含有历史事件的实体; 正例 = 未来无事件 (流失)
+    # 仅包含有历史事件的实体; 正例 = 流失 (长期沉默、低频实体更可能为正)
     history_gated_future_inactive: 0.08
-    # 仅包含有历史事件的实体; 正例 = 未来仍有事件 (留存)
+    # 仅包含有历史事件的实体; 正例 = 留存 (近期活跃、高频实体更可能为正)
     history_gated_future_active: 0.07
     future_event_attribute_condition: 0.20
     temporal_relational_aggregate: 0.20
+    # 事件行级曝光→响应 (CTR); 每条 Event 行预测一次曝光是否产生响应,
+    # 实体在自身时间前有历史曝光才入样本; invert 时正例表示 ignore
+    interaction_response: 0.15
 
   # <== 分布参数: support/query 划分。
   support_fraction: 0.70         # (0, 1)
@@ -387,6 +390,37 @@ task:
   horizon_fraction_max: 0.30
   positive_rate_min: 0.20        # 目标正例率采样区间
   positive_rate_max: 0.80
+
+  # <== 分布参数: history-gated 子模式的软标签倾向权重 (β) 采样区间。
+  #    propensity = sigmoid(logit(base_rate) + β_freq·log1p(频率) − β_sil·沉默时长/跨度);
+  #    正例率只作软约束 (logistic 截距), 不再按硬分位数强行对齐。
+  history_gated_frequency_weight_min: 0.5
+  history_gated_frequency_weight_max: 3.0
+  history_gated_silence_weight_min: 0.5
+  history_gated_silence_weight_max: 3.0
+
+  # <== 分布参数: temporal aggregate 窗口 regime 混合。
+  #    每个任务抽一种: REPEATED (短窗+长窗求和, 嵌套多尺度) / SHORT / LONG。
+  window_repeated_probability: 0.25   # P(REPEATED)
+  window_short_probability: 0.5       # 非 REPEATED 时选 SHORT 的条件概率
+  window_short_fraction_min: 0.05     # SHORT 窗口占跨度比例区间
+  window_short_fraction_max: 0.15
+  window_long_fraction_min: 0.30      # LONG 窗口占跨度比例区间
+  window_long_fraction_max: 0.60
+
+  # <== 分布参数: interaction_response 机制的 β 权重采样区间。
+  #    z = logit(base_rate) + β_u·U_e + β_f·F_e − β_s·S_e + β_p·P_e;
+  #    U_e = entity 父表可用特征 (min-max 归一化), F_e/P_e = log1p(历史曝光次数),
+  #    S_e = 距上次曝光的归一化沉默; base_rate 由 positive_rate 区间采样。
+  interaction_u_weight_min: 0.25
+  interaction_u_weight_max: 2.0
+  interaction_frequency_weight_min: 0.5
+  interaction_frequency_weight_max: 3.0
+  interaction_silence_weight_min: 0.5
+  interaction_silence_weight_max: 3.0
+  interaction_item_weight_min: 0.5
+  interaction_item_weight_max: 3.0
+  interaction_invert_probability: 0.35  # 整任务反转标签: invert=1 时正例表示 ignore
 
   max_attempts_per_database: 128
   require_full_task_count: true  # 凑不齐 tasks_per_database 时报错

@@ -35,6 +35,13 @@ from rdb_prior.task.view import build_task_view
 # sourced from an existing feature column.
 _SYNTHETIC_TARGET = "__label__"
 
+# History-gated sub-modes derive a dedicated label stream by XOR-mixing the
+# plan seed (int) with this fixed constant; the derived stream is never stored
+# in ``TaskPlan.parameters`` because those values are coerced to float and a
+# 64-bit seed would lose precision above 2^53, breaking exact label replay.
+_LABEL_SEED_MAGIC = 0x9E3779B1
+_MAX_LABEL_RETRIES = 16
+
 
 # ---------------------------------------------------------------------------
 # Unified target-table sampling
@@ -106,6 +113,20 @@ class TemporalAggregateCandidate:
     time_column_id: str
     operator: AggregateOperator
     source_column_id: str | None
+    target_column_id: str = _SYNTHETIC_TARGET
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InteractionCandidate:
+    """One interaction-response task shape: an Event row is an interaction whose
+    response is predicted from the entity's historical interaction behavior and
+    (optionally) the item/context's historical interaction count."""
+
+    event_table_id: str
+    entity_foreign_key_id: str
+    item_foreign_key_id: str | None
+    time_column_id: str
+    feature_column_id: str
     target_column_id: str = _SYNTHETIC_TARGET
 
 
@@ -203,6 +224,63 @@ def future_event_attribute_candidates(
                             source_column_id=source,
                             foreign_key_id=fk.foreign_key_id,
                             time_column_id=time_column,
+                        )
+                    )
+    return tuple(result)
+
+
+def interaction_candidates(
+    schema: PhysicalSchema, database: DatabaseInstance
+) -> tuple[InteractionCandidate, ...]:
+    """Enumerate interaction-response candidate shapes.
+
+    Each Event row is treated as one interaction linking an entity parent (the
+    ``user``) to an optional second parent (the ``item``/context). The entity
+    FK must point at an ENTITY-role parent carrying at least one usable
+    feature (the ``U_e`` user-propensity input); the optional item FK points
+    at a different parent table. Candidates cover every usable entity feature
+    and both the no-item and each-item variant.
+    """
+    result: list[InteractionCandidate] = []
+    for event in schema.tables:
+        if event.role is not TableRole.EVENT:
+            continue
+        time_column = _time_column(event)
+        if time_column is None:
+            continue
+        outgoing = [
+            foreign_key
+            for foreign_key in schema.foreign_keys
+            if foreign_key.child_table_id == event.table_id
+        ]
+        for entity_fk in outgoing:
+            parent = schema.table(entity_fk.parent_table_id)
+            if parent.role is not TableRole.ENTITY:
+                continue
+            features = _usable_feature_columns(
+                schema, database, parent.table_id
+            )
+            if not features:
+                continue
+            item_options = [None] + [
+                foreign_key
+                for foreign_key in outgoing
+                if foreign_key.foreign_key_id != entity_fk.foreign_key_id
+                and foreign_key.parent_table_id != entity_fk.parent_table_id
+            ]
+            for feature in features:
+                for item_fk in item_options:
+                    result.append(
+                        InteractionCandidate(
+                            event_table_id=event.table_id,
+                            entity_foreign_key_id=entity_fk.foreign_key_id,
+                            item_foreign_key_id=(
+                                None
+                                if item_fk is None
+                                else item_fk.foreign_key_id
+                            ),
+                            time_column_id=time_column,
+                            feature_column_id=feature,
                         )
                     )
     return tuple(result)
@@ -340,17 +418,21 @@ def _build_history_gated_submode_task(
     cutoff_quantile_min: float, cutoff_quantile_max: float,
     horizon_fraction_min: float, horizon_fraction_max: float,
     positive_rate_min: float, positive_rate_max: float,
+    history_gated_frequency_weight_min: float,
+    history_gated_frequency_weight_max: float,
+    history_gated_silence_weight_min: float,
+    history_gated_silence_weight_max: float,
     mechanism: TaskMechanism,
-    label_values: Callable[
-        [PhysicalSchema, DatabaseInstance, FutureEventCandidate, int, int],
-        np.ndarray,
-    ],
 ) -> PlannedTask | None:
-    """Build a history-gated sub-mode task where only entities with prior
-    history are included in the sample.
+    """Build a history-gated sub-mode task with soft propensity labels.
 
-    The *label_values* callable returns ``-1`` for entities without history;
-    those rows are excluded from the support/query split.
+    Only entities with prior history are included in the sample (``-1``
+    otherwise). Each such entity draws ``Bernoulli(propensity)`` where the
+    propensity rises with pre-cutoff event frequency and falls with the
+    silence since the last event, so recently-active entities are more likely
+    positive. The requested positive rate only sets a logistic base-rate
+    intercept (a soft constraint) — it is never matched by a hard post-hoc
+    horizon sweep.
     """
     rng = _rng(seed)
     event = database.table(candidate.event_table_id)
@@ -359,29 +441,36 @@ def _build_history_gated_submode_task(
         return None
     cutoff_q = float(rng.uniform(cutoff_quantile_min, cutoff_quantile_max))
     cutoff = int(np.quantile(times, cutoff_q))
-    desired = float(rng.uniform(positive_rate_min, positive_rate_max))
-    low = cutoff + max(1, round((int(times.max()) - int(times.min())) * horizon_fraction_min))
-    high = cutoff + max(1, round((int(times.max()) - int(times.min())) * horizon_fraction_max))
-    horizon_candidates = np.unique(np.clip(times[(times > cutoff)], low, high))
-    if not len(horizon_candidates):
-        return None
-    best: tuple[float, int, np.ndarray] | None = None
-    for horizon in horizon_candidates:
-        plan_stub = (cutoff, int(horizon))
-        labels = label_values(schema, database, candidate, *plan_stub)
-        # Only consider entities with history (label >= 0) for rate matching.
-        valid_mask = labels >= 0
-        if not np.any(valid_mask):
-            continue
-        valid_labels = labels[valid_mask]
-        item = (abs(float(np.mean(valid_labels)) - desired), int(horizon), labels)
-        if best is None or item[0] < best[0]:
-            best = item
-    if best is None:
-        return None
-    _distance, horizon, labels = best
+    span = int(times.max()) - int(times.min())
+    horizon = cutoff + max(
+        1, round(span * float(rng.uniform(horizon_fraction_min, horizon_fraction_max)))
+    )
+    beta_freq = float(rng.uniform(
+        history_gated_frequency_weight_min, history_gated_frequency_weight_max
+    ))
+    beta_sil = float(rng.uniform(
+        history_gated_silence_weight_min, history_gated_silence_weight_max
+    ))
+    base_rate = float(rng.uniform(positive_rate_min, positive_rate_max))
+    invert = mechanism is TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE
+    label_rng = _label_rng(seed)
+    labels = _history_gated_propensity_values(
+        schema, database, candidate, cutoff=cutoff,
+        beta_freq=beta_freq, beta_sil=beta_sil, base_rate=base_rate,
+        invert=invert, rng=label_rng,
+    )
+    retries = 0
+    while len(np.unique(labels[labels >= 0])) < 2 and retries < _MAX_LABEL_RETRIES:
+        labels = _history_gated_propensity_values(
+            schema, database, candidate, cutoff=cutoff,
+            beta_freq=beta_freq, beta_sil=beta_sil, base_rate=base_rate,
+            invert=invert, rng=label_rng,
+        )
+        retries += 1
     # Filter to only entities with history for the split.
     valid_mask = labels >= 0
+    if not np.any(valid_mask):
+        return None
     valid_indices = np.flatnonzero(valid_mask).astype(np.int64)
     valid_labels = labels[valid_mask]
     split = _stratified_split(
@@ -413,9 +502,16 @@ def _build_history_gated_submode_task(
             required_paths=((candidate.foreign_key_id,),),
         ),
         classification_kind=ClassificationKind.BINARY,
-        requested_positive_rate=desired,
+        requested_positive_rate=base_rate,
         realized_positive_rate=float(np.mean(valid_labels)),
-        parameters=(("cutoff_quantile", cutoff_q), ("support_fraction", support_fraction)),
+        parameters=(
+            ("cutoff_quantile", cutoff_q),
+            ("beta_freq", beta_freq),
+            ("beta_sil", beta_sil),
+            ("base_rate", base_rate),
+            ("label_retries", float(retries)),
+            ("support_fraction", support_fraction),
+        ),
     )
     return _planned_if_visible(
         schema, database, plan, labels, support, query
@@ -484,8 +580,13 @@ def build_history_gated_future_inactive_task(
     cutoff_quantile_min: float, cutoff_quantile_max: float,
     horizon_fraction_min: float, horizon_fraction_max: float,
     positive_rate_min: float = 0.15, positive_rate_max: float = 0.65,
+    history_gated_frequency_weight_min: float = 0.5,
+    history_gated_frequency_weight_max: float = 3.0,
+    history_gated_silence_weight_min: float = 0.5,
+    history_gated_silence_weight_max: float = 3.0,
 ) -> PlannedTask | None:
-    """Sub-mode 1: only entities with history. Positive = no future events after cutoff."""
+    """Sub-mode 1: only entities with history. Positive = churned (silent,
+    low-frequency entities are more likely positive)."""
     return _build_history_gated_submode_task(
         task_id=task_id, sample_id=sample_id, schema=schema,
         database=database, candidate=candidate, seed=seed,
@@ -498,8 +599,11 @@ def build_history_gated_future_inactive_task(
         horizon_fraction_max=horizon_fraction_max,
         positive_rate_min=positive_rate_min,
         positive_rate_max=positive_rate_max,
+        history_gated_frequency_weight_min=history_gated_frequency_weight_min,
+        history_gated_frequency_weight_max=history_gated_frequency_weight_max,
+        history_gated_silence_weight_min=history_gated_silence_weight_min,
+        history_gated_silence_weight_max=history_gated_silence_weight_max,
         mechanism=TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE,
-        label_values=_history_gated_inactive_values,
     )
 
 
@@ -511,8 +615,13 @@ def build_history_gated_future_active_task(
     cutoff_quantile_min: float, cutoff_quantile_max: float,
     horizon_fraction_min: float, horizon_fraction_max: float,
     positive_rate_min: float = 0.15, positive_rate_max: float = 0.65,
+    history_gated_frequency_weight_min: float = 0.5,
+    history_gated_frequency_weight_max: float = 3.0,
+    history_gated_silence_weight_min: float = 0.5,
+    history_gated_silence_weight_max: float = 3.0,
 ) -> PlannedTask | None:
-    """Sub-mode 2: only entities with history. Positive = has future events after cutoff."""
+    """Sub-mode 2: only entities with history. Positive = retained (recent,
+    high-frequency entities are more likely positive)."""
     return _build_history_gated_submode_task(
         task_id=task_id, sample_id=sample_id, schema=schema,
         database=database, candidate=candidate, seed=seed,
@@ -525,8 +634,11 @@ def build_history_gated_future_active_task(
         horizon_fraction_max=horizon_fraction_max,
         positive_rate_min=positive_rate_min,
         positive_rate_max=positive_rate_max,
+        history_gated_frequency_weight_min=history_gated_frequency_weight_min,
+        history_gated_frequency_weight_max=history_gated_frequency_weight_max,
+        history_gated_silence_weight_min=history_gated_silence_weight_min,
+        history_gated_silence_weight_max=history_gated_silence_weight_max,
         mechanism=TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE,
-        label_values=_history_gated_active_values,
     )
 
 
@@ -659,9 +771,18 @@ def build_temporal_relational_aggregate_task(
     seed: int, support_fraction: float, min_support_rows: int,
     min_query_rows: int, min_class_count_per_split: int,
     cutoff_quantile_min: float, cutoff_quantile_max: float,
-    horizon_fraction_min: float, horizon_fraction_max: float,
+    window_repeated_probability: float, window_short_probability: float,
+    window_short_fraction_min: float, window_short_fraction_max: float,
+    window_long_fraction_min: float, window_long_fraction_max: float,
     positive_rate_min: float = 0.2, positive_rate_max: float = 0.8,
 ) -> PlannedTask | None:
+    """Build a temporal relational aggregate task with mixed window regimes.
+
+    The aggregation window is sampled per task from three regimes: SHORT
+    (a small single window), LONG (a large single window) or REPEATED (a
+    short *and* a long window nested at the same cutoff, summed). This mixes
+    near-term and longer-term activity signals across the task corpus.
+    """
     rng = _rng(seed)
     target = schema.table(candidate.target_table_id)
     source_times = database.table(candidate.source_table_id).column(candidate.time_column_id)
@@ -669,16 +790,31 @@ def build_temporal_relational_aggregate_task(
         return None
     row_cutoff_column = _time_column(target) if target.role is TableRole.EVENT else None
     span = int(source_times.max()) - int(source_times.min())
-    window = max(1, round(span * float(rng.uniform(horizon_fraction_min, horizon_fraction_max))))
+
+    def _fraction_window(lo: float, hi: float) -> int:
+        return max(1, round(span * float(rng.uniform(lo, hi))))
+
+    if rng.random() < window_repeated_probability:
+        regime = 2
+        window = _fraction_window(window_short_fraction_min, window_short_fraction_max)
+        window_extended = _fraction_window(window_long_fraction_min, window_long_fraction_max)
+    else:
+        regime = 0 if rng.random() < window_short_probability else 1
+        if regime == 0:
+            window = _fraction_window(window_short_fraction_min, window_short_fraction_max)
+        else:
+            window = _fraction_window(window_long_fraction_min, window_long_fraction_max)
+        window_extended = None
+    windows = (window,) if window_extended is None else (window, window_extended)
     if row_cutoff_column is None:
         cutoff = int(np.quantile(source_times, float(rng.uniform(cutoff_quantile_min, cutoff_quantile_max))))
-        horizon = min(int(source_times.max()), cutoff + window)
+        horizon = min(int(source_times.max()), cutoff + max(windows))
         cutoffs = np.full(database.table(target.table_id).row_count, cutoff, dtype=np.int64)
     else:
         cutoff = None
         horizon = None
         cutoffs = database.table(target.table_id).column(row_cutoff_column).astype(np.int64)
-    aggregates = _aggregate_values(schema, database, candidate, cutoffs, window)
+    aggregates = _windowed_aggregates(schema, database, candidate, cutoffs, windows)
     desired = float(rng.uniform(positive_rate_min, positive_rate_max))
     labels, threshold = _threshold_labels(aggregates, desired)
     split = _stratified_split(
@@ -690,6 +826,13 @@ def build_temporal_relational_aggregate_task(
         return None
     support, query = split
     visibility_cutoff = int(np.max(cutoffs)) if cutoff is None else int(cutoff)
+    parameters = [
+        ("window", float(window)),
+        ("window_regime", float(regime)),
+        ("support_fraction", support_fraction),
+    ]
+    if window_extended is not None:
+        parameters.append(("window_extended", float(window_extended)))
     plan = TaskPlan(
         task_id=task_id, sample_id=sample_id, instance_id=database.instance_id,
         schema_id=schema.schema_id,
@@ -713,7 +856,113 @@ def build_temporal_relational_aggregate_task(
         aggregate_operator=candidate.operator,
         threshold=threshold, requested_positive_rate=desired,
         realized_positive_rate=float(np.mean(labels)),
-        parameters=(("window", window), ("support_fraction", support_fraction)),
+        parameters=tuple(parameters),
+    )
+    return _planned_if_visible(
+        schema, database, plan, labels, support, query
+    )
+
+
+def build_interaction_response_task(
+    *, task_id: str, sample_id: str, schema: PhysicalSchema,
+    database: DatabaseInstance, candidate: InteractionCandidate,
+    seed: int, support_fraction: float, min_support_rows: int,
+    min_query_rows: int, min_class_count_per_split: int,
+    positive_rate_min: float, positive_rate_max: float,
+    interaction_u_weight_min: float, interaction_u_weight_max: float,
+    interaction_frequency_weight_min: float, interaction_frequency_weight_max: float,
+    interaction_silence_weight_min: float, interaction_silence_weight_max: float,
+    interaction_item_weight_min: float, interaction_item_weight_max: float,
+    interaction_invert_probability: float,
+) -> PlannedTask | None:
+    """Build an interaction-response task over an Event table.
+
+    Every Event row is an interaction; rows whose entity has no prior interaction
+    are excluded (``-1``) and the rest draw ``Bernoulli(propensity)`` from a
+    base rate plus per-task frequency/recency/entity/item weights. Each task
+    independently samples its beta weights and flips the label (response vs
+    ignore) with ``interaction_invert_probability``.
+    """
+    rng = _rng(seed)
+    event = database.table(candidate.event_table_id)
+    times = event.column(candidate.time_column_id)
+    if len(times) < 2 or int(times.max()) <= int(times.min()):
+        return None
+    beta_u = float(rng.uniform(interaction_u_weight_min, interaction_u_weight_max))
+    beta_f = float(rng.uniform(
+        interaction_frequency_weight_min, interaction_frequency_weight_max
+    ))
+    beta_s = float(rng.uniform(
+        interaction_silence_weight_min, interaction_silence_weight_max
+    ))
+    beta_p = float(rng.uniform(
+        interaction_item_weight_min, interaction_item_weight_max
+    ))
+    base_rate = float(rng.uniform(positive_rate_min, positive_rate_max))
+    invert = bool(rng.random() < interaction_invert_probability)
+    label_rng = _label_rng(seed)
+    labels = _interaction_response_values(
+        schema, database, candidate, beta_u=beta_u, beta_f=beta_f,
+        beta_s=beta_s, beta_p=beta_p, base_rate=base_rate,
+        invert=invert, rng=label_rng,
+    )
+    retries = 0
+    while len(np.unique(labels[labels >= 0])) < 2 and retries < _MAX_LABEL_RETRIES:
+        labels = _interaction_response_values(
+            schema, database, candidate, beta_u=beta_u, beta_f=beta_f,
+            beta_s=beta_s, beta_p=beta_p, base_rate=base_rate,
+            invert=invert, rng=label_rng,
+        )
+        retries += 1
+    valid_mask = labels >= 0
+    if not np.any(valid_mask):
+        return None
+    valid_indices = np.flatnonzero(valid_mask).astype(np.int64)
+    split = _stratified_split(
+        labels[valid_mask], rng, support_fraction=support_fraction,
+        min_support_rows=min_support_rows, min_query_rows=min_query_rows,
+        min_class_count=min_class_count_per_split,
+    )
+    if split is None:
+        return None
+    valid_support, valid_query = split
+    support = valid_indices[valid_support]
+    query = valid_indices[valid_query]
+    entity_fk = _foreign_key(schema, candidate.entity_foreign_key_id)
+    plan = TaskPlan(
+        task_id=task_id, sample_id=sample_id, instance_id=database.instance_id,
+        schema_id=schema.schema_id,
+        mechanism=TaskMechanism.INTERACTION_RESPONSE,
+        prediction_type=PredictionType.CLASSIFICATION,
+        target_table_id=candidate.event_table_id,
+        source_table_id=entity_fk.parent_table_id,
+        target_column_id=candidate.target_column_id,
+        source_column_id=candidate.feature_column_id,
+        foreign_key_id=candidate.entity_foreign_key_id,
+        secondary_foreign_key_id=candidate.item_foreign_key_id,
+        time_column_id=candidate.time_column_id,
+        row_cutoff_time_column_id=candidate.time_column_id,
+        split_strategy="stratified_rows", seed=seed,
+        masked_column_ids=(candidate.target_column_id,),
+        observation_rules=_observation_rules(schema, int(times.max())),
+        route_supervision=_schema_route_labels(
+            schema, target_table_id=candidate.event_table_id,
+            required_paths=((candidate.entity_foreign_key_id,),),
+            optional_paths=(
+                ((candidate.item_foreign_key_id,),)
+                if candidate.item_foreign_key_id is not None
+                else ()
+            ),
+        ),
+        classification_kind=ClassificationKind.BINARY,
+        requested_positive_rate=base_rate if not invert else (1.0 - base_rate),
+        realized_positive_rate=float(np.mean(labels[valid_mask])),
+        parameters=(
+            ("beta_u", beta_u), ("beta_f", beta_f), ("beta_s", beta_s),
+            ("beta_p", beta_p), ("base_rate", base_rate),
+            ("invert", float(invert)), ("label_retries", float(retries)),
+            ("support_fraction", support_fraction),
+        ),
     )
     return _planned_if_visible(
         schema, database, plan, labels, support, query
@@ -727,6 +976,33 @@ def mechanism_labels(
         label.foreign_key_ids for label in plan.route_supervision
         if label.role is RouteRole.REQUIRED
     )
+    if plan.mechanism is TaskMechanism.INTERACTION_RESPONSE:
+        candidate = InteractionCandidate(
+            event_table_id=plan.target_table_id,
+            entity_foreign_key_id=plan.foreign_key_id or "",
+            item_foreign_key_id=plan.secondary_foreign_key_id,
+            time_column_id=plan.time_column_id or "",
+            feature_column_id=plan.source_column_id or "",
+        )
+        # Replay the same per-row label stream the builder drew. Each pass
+        # consumes exactly one uniform per history-gated row in row order, so
+        # label_retries+1 passes land on the builder's final stream position.
+        params = plan.parameter_map
+        label_rng = _label_rng(plan.seed)
+        labels = None
+        for _ in range(int(params.get("label_retries", 0.0)) + 1):
+            labels = _interaction_response_values(
+                schema, database, candidate,
+                beta_u=float(params["beta_u"]),
+                beta_f=float(params["beta_f"]),
+                beta_s=float(params["beta_s"]),
+                beta_p=float(params["beta_p"]),
+                base_rate=float(params["base_rate"]),
+                invert=bool(params["invert"]),
+                rng=label_rng,
+            )
+        assert labels is not None
+        return labels
     if plan.mechanism in {
         TaskMechanism.ENTITY_FUTURE_EVENT_EXISTENCE,
         TaskMechanism.HISTORY_GATED_FUTURE_ACTIVITY,
@@ -740,16 +1016,32 @@ def mechanism_labels(
             time_column_id=plan.time_column_id or "",
         )
         if plan.mechanism is TaskMechanism.ENTITY_FUTURE_EVENT_EXISTENCE:
-            values = _future_existence_values
-        elif plan.mechanism is TaskMechanism.HISTORY_GATED_FUTURE_ACTIVITY:
-            values = _history_gated_values
-        elif plan.mechanism is TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE:
-            values = _history_gated_inactive_values
-        else:
-            values = _history_gated_active_values
-        return values(
-            schema, database, candidate, int(plan.cutoff_time), int(plan.horizon_end_time)
-        )
+            return _future_existence_values(
+                schema, database, candidate,
+                int(plan.cutoff_time), int(plan.horizon_end_time),
+            )
+        if plan.mechanism is TaskMechanism.HISTORY_GATED_FUTURE_ACTIVITY:
+            return _history_gated_values(
+                schema, database, candidate,
+                int(plan.cutoff_time), int(plan.horizon_end_time),
+            )
+        # Stochastic sub-modes: replay the same label stream the builder drew.
+        # Each pass consumes exactly entity_count uniforms, so label_retries+1
+        # passes land on the builder's final stream position.
+        params = plan.parameter_map
+        label_rng = _label_rng(plan.seed)
+        labels = None
+        for _ in range(int(params.get("label_retries", 0.0)) + 1):
+            labels = _history_gated_propensity_values(
+                schema, database, candidate, cutoff=int(plan.cutoff_time),
+                beta_freq=float(params["beta_freq"]),
+                beta_sil=float(params["beta_sil"]),
+                base_rate=float(params["base_rate"]),
+                invert=(plan.mechanism is TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE),
+                rng=label_rng,
+            )
+        assert labels is not None
+        return labels
     # Imported/legacy autocomplete tasks use the observed target column as the
     # benchmark label and therefore do not carry synthetic SCM source metadata.
     if (
@@ -784,9 +1076,10 @@ def mechanism_labels(
             operator=plan.aggregate_operator or AggregateOperator.COUNT,
             source_column_id=plan.source_column_id,
         )
-        values = _aggregate_values(
-            schema, database, candidate, cutoffs, int(plan.parameter_map["window"])
-        )
+        window = int(plan.parameter_map["window"])
+        extended = plan.parameter_map.get("window_extended")
+        windows = (window,) if extended is None else (window, int(extended))
+        values = _windowed_aggregates(schema, database, candidate, cutoffs, windows)
         return (values > float(plan.threshold)).astype(np.int8)
     raise ValueError(f"unsupported mechanism {plan.mechanism.value}")
 
@@ -828,57 +1121,133 @@ def _history_gated_values(
     return (has_history & ~has_future).astype(np.int8)
 
 
-def _history_gated_inactive_values(
+def _history_gated_propensity_values(
     schema: PhysicalSchema, database: DatabaseInstance,
-    candidate: FutureEventCandidate, cutoff: int, horizon: int,
+    candidate: FutureEventCandidate, *, cutoff: int,
+    beta_freq: float, beta_sil: float, base_rate: float,
+    invert: bool, rng: np.random.Generator,
 ) -> np.ndarray:
-    """Mode 1: only entities with history. Positive = no future events (churned).
+    """Stochastic history-gated labels driven by frequency and recency.
 
-    Returns labels of shape ``(entity_count,)`` where ``-1`` marks entities
-    without any history — those are excluded from the support/query split.
+    The positive propensity rises with the number of pre-cutoff events and
+    falls with the silence since the last one. ``invert`` flips the sign so
+    the INACTIVE sub-mode predicts churn (silent, low-frequency entities more
+    likely positive). Entities without any history are ``-1`` and excluded
+    from the support/query split.
+
+    Determinism contract: exactly one ``rng.random(entity_count)`` draw per
+    call, consumed in entity-row order, so callers can replay the same label
+    stream from a dedicated ``_label_rng``. Do not add, remove, or reorder
+    draws on this stream.
     """
     fk = _foreign_key(schema, candidate.foreign_key_id)
     event = database.table(candidate.event_table_id)
     times = event.column(candidate.time_column_id)
     assignments = event.column(fk.child_column_id)
     entity_count = database.table(candidate.entity_table_id).row_count
-    valid = assignments >= 0
-    has_history = np.zeros(entity_count, dtype=bool)
-    has_future = np.zeros(entity_count, dtype=bool)
-    has_history[np.unique(assignments[valid & (times <= cutoff)])] = True
-    has_future[
-        np.unique(assignments[valid & (times > cutoff) & (times <= horizon)])
-    ] = True
     labels = np.full(entity_count, -1, dtype=np.int8)
-    labels[has_history & ~has_future] = 1
-    labels[has_history & has_future] = 0
+    history = (assignments >= 0) & (times <= cutoff)
+    if not np.any(history):
+        return labels
+    counts = np.bincount(assignments[history], minlength=entity_count)
+    last = np.full(entity_count, -1, dtype=np.int64)
+    np.maximum.at(last, assignments[history], times[history])
+    history_mask = counts > 0
+    span = max(1, int(times.max()) - int(times.min()))
+    freq_norm = np.zeros(entity_count, dtype=np.float64)
+    silence = np.zeros(entity_count, dtype=np.float64)
+    freq_norm[history_mask] = np.log1p(counts[history_mask]) / np.log1p(counts.max())
+    silence[history_mask] = np.clip((cutoff - last[history_mask]) / span, 0.0, 1.0)
+    z = _logit(base_rate) + beta_freq * freq_norm - beta_sil * silence
+    if invert:
+        z = -z
+    propensity = _sigmoid(z)
+    draws = rng.random(entity_count)
+    positive = (draws < propensity) & history_mask
+    labels[positive] = 1
+    labels[history_mask & ~positive] = 0
     return labels
 
 
-def _history_gated_active_values(
+def _interaction_response_values(
     schema: PhysicalSchema, database: DatabaseInstance,
-    candidate: FutureEventCandidate, cutoff: int, horizon: int,
+    candidate: InteractionCandidate, *, beta_u: float, beta_f: float,
+    beta_s: float, beta_p: float, base_rate: float, invert: bool,
+    rng: np.random.Generator,
 ) -> np.ndarray:
-    """Mode 2: only entities with history. Positive = has future events (retained).
+    """Stochastic per-interaction response labels gated on prior entity interaction.
 
-    Returns labels of shape ``(entity_count,)`` where ``-1`` marks entities
-    without any history — those are excluded from the support/query split.
+    Every Event row is an interaction of entity ``u_e`` at time ``t_e``. The row
+    is ``-1`` unless the entity has at least one interaction strictly before
+    ``t_e`` (history gating); otherwise it draws ``Bernoulli(sigmoid(z))`` with
+    ``z = logit(base_rate) + beta_u*U_e + beta_f*F_e - beta_s*S_e + beta_p*P_e``
+    where ``U_e`` is a normalized entity feature, ``F_e``/``P_e`` are log1p
+    historical interaction counts of the entity and (optional) item, and ``S_e``
+    is the normalized silence since the entity's last interaction. ``invert``
+    flips the sign so positive means "ignore" (``1 - response``).
+
+    Determinism contract: exactly one ``rng.random()`` draw per gated row,
+    consumed in event-row order, so callers can replay the same label stream
+    from a dedicated ``_label_rng``. Do not add, remove, or reorder draws on
+    this stream.
     """
-    fk = _foreign_key(schema, candidate.foreign_key_id)
     event = database.table(candidate.event_table_id)
-    times = event.column(candidate.time_column_id)
-    assignments = event.column(fk.child_column_id)
-    entity_count = database.table(candidate.entity_table_id).row_count
-    valid = assignments >= 0
-    has_history = np.zeros(entity_count, dtype=bool)
-    has_future = np.zeros(entity_count, dtype=bool)
-    has_history[np.unique(assignments[valid & (times <= cutoff)])] = True
-    has_future[
-        np.unique(assignments[valid & (times > cutoff) & (times <= horizon)])
-    ] = True
-    labels = np.full(entity_count, -1, dtype=np.int8)
-    labels[has_history & has_future] = 1
-    labels[has_history & ~has_future] = 0
+    times = event.column(candidate.time_column_id).astype(np.int64)
+    row_count = len(times)
+    entity_fk = _foreign_key(schema, candidate.entity_foreign_key_id)
+    entity = event.column(entity_fk.child_column_id)
+    item_fk = (
+        None
+        if candidate.item_foreign_key_id is None
+        else _foreign_key(schema, candidate.item_foreign_key_id)
+    )
+    item = (
+        event.column(item_fk.child_column_id)
+        if item_fk is not None
+        else None
+    )
+    entity_values = database.table(entity_fk.parent_table_id).column(
+        candidate.feature_column_id
+    )
+    raw_feature = _numeric(entity_values)
+    observed = raw_feature[_observed_mask(entity_values)]
+    low = float(observed.min())
+    high = float(observed.max())
+    u_norm = np.clip((raw_feature - low) / max(high - low, 1e-12), 0.0, 1.0)
+    span = max(1, int(times.max()) - int(times.min()))
+    labels = np.full(row_count, -1, dtype=np.int8)
+    for e in range(row_count):
+        ent = int(entity[e])
+        if ent < 0:
+            continue
+        t_e = int(times[e])
+        entity_history = (entity == ent) & (times < t_e)
+        if not np.any(entity_history):
+            continue
+        count_f = np.count_nonzero(entity_history)
+        last = int(times[entity_history].max())
+        f = float(np.log1p(count_f))
+        s = float(np.clip((t_e - last) / span, 0.0, 1.0))
+        p = 0.0
+        if item is not None:
+            item_id = int(item[e])
+            if item_id >= 0:
+                p = float(
+                    np.log1p(
+                        np.count_nonzero((item == item_id) & (times < t_e))
+                    )
+                )
+        u = float(u_norm[ent]) if 0 <= ent < len(u_norm) else 0.0
+        z = (
+            _logit(base_rate)
+            + beta_u * u
+            + beta_f * f
+            - beta_s * s
+            + beta_p * p
+        )
+        if invert:
+            z = -z
+        labels[e] = 1 if rng.random() < float(_sigmoid(z)) else 0
     return labels
 
 
@@ -926,6 +1295,23 @@ def _aggregate_values(
         else:
             output[index] = float(np.min(values[selected]))
     return output
+
+
+def _windowed_aggregates(
+    schema: PhysicalSchema, database: DatabaseInstance,
+    candidate: TemporalAggregateCandidate, cutoffs: np.ndarray,
+    windows: tuple[int, ...],
+) -> np.ndarray:
+    """Sum the aggregate over several windows anchored at the same cutoff.
+
+    Used by the REPEATED (nested multi-scale) window regime: the label then
+    reflects both near-term (short window) and longer-term (extended window)
+    activity. The recompute path must supply the exact same window tuple.
+    """
+    total = np.zeros(len(cutoffs), dtype=np.float64)
+    for window in windows:
+        total += _aggregate_values(schema, database, candidate, cutoffs, int(window))
+    return total
 
 
 def _traverse_path(
@@ -1161,6 +1547,25 @@ def _temporal_split(
 
 def _rng(seed: int) -> np.random.Generator:
     return np.random.Generator(np.random.PCG64DXSM(seed))
+
+
+def _label_rng(seed: int) -> np.random.Generator:
+    """Dedicated label stream for stochastic history-gated sub-mode labels.
+
+    Derived from the int plan seed so ``mechanism_labels`` can replay the
+    exact same draws independently of the builder's main RNG (cutoff, horizon,
+    split shuffles). Never stored in ``TaskPlan.parameters`` — those values
+    are coerced to float and a 64-bit seed loses precision above 2^53.
+    """
+    return _rng(seed ^ _LABEL_SEED_MAGIC)
+
+
+def _logit(probability: float) -> float:
+    return float(np.log(probability / (1.0 - probability)))
+
+
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-z))
 
 
 __all__ = [

@@ -13,6 +13,7 @@ from rdb_prior.runtime import digest_config
 from rdb_prior.task.artifacts import TaskArtifactWriter
 from rdb_prior.task.planner import TaskPlanner, TaskPlannerConfig
 from rdb_prior.task.validation import validate_task
+from rdb_prior.validation.checks import validate_database_instance
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -149,6 +150,20 @@ def generate_tasks(
         schema_artifact = load_schema_artifact(schema_path)
         schema = schema_artifact.compilation.schema
         database = instance_artifact.database
+        instance_report = validate_database_instance(
+            schema,
+            instance_artifact.plan,
+            database,
+        )
+        if not instance_report.is_valid:
+            issues = [
+                issue.to_dict()
+                for issue in instance_report.issues
+            ]
+            raise ValueError(
+                f"invalid database instance {instance_artifact.instance_id}: "
+                f"{issues}"
+            )
         runtime = instance_artifact.runtime.restore_context().child("task")
         tasks = planner.generate(
             sample_id=instance_artifact.sample_id,

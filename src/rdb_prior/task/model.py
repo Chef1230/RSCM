@@ -18,6 +18,7 @@ class TaskMechanism(str, Enum):
     RELATION_ATTRIBUTE = "relation_attribute"
     FUTURE_EVENT_ATTRIBUTE_CONDITION = "future_event_attribute_condition"
     TEMPORAL_RELATIONAL_AGGREGATE = "temporal_relational_aggregate"
+    INTERACTION_RESPONSE = "interaction_response"
 
 
 class ClassificationKind(str, Enum):
@@ -118,6 +119,7 @@ class TaskPlan:
     target_column_id: str | None = None
     source_column_id: str | None = None
     foreign_key_id: str | None = None
+    secondary_foreign_key_id: str | None = None
     time_column_id: str | None = None
     cutoff_time: int | None = None
     horizon_end_time: int | None = None
@@ -157,6 +159,7 @@ class TaskPlan:
             "target_column_id",
             "source_column_id",
             "foreign_key_id",
+            "secondary_foreign_key_id",
             "time_column_id",
             "row_cutoff_time_column_id",
         ):
@@ -236,13 +239,14 @@ class TaskPlan:
 
     @property
     def signature(self) -> tuple[Any, ...]:
-        return (
+        base = (
             self.mechanism.value,
             self.target_table_id,
             self.source_table_id,
             self.target_column_id,
             self.source_column_id,
             self.foreign_key_id,
+            self.secondary_foreign_key_id,
             self.cutoff_time,
             self.horizon_end_time,
             self.row_cutoff_time_column_id,
@@ -254,6 +258,37 @@ class TaskPlan:
                 if label.role is RouteRole.REQUIRED
             ),
         )
+        # Window / propensity parameters are not part of ``parameters`` in the
+        # base signature, so different window regimes or soft-label weights on
+        # the same candidate would otherwise collide in planner dedup. Append
+        # them per mechanism only (signature is used solely for dedup).
+        if self.mechanism is TaskMechanism.TEMPORAL_RELATIONAL_AGGREGATE:
+            extra = (
+                self.parameter_map.get("window"),
+                self.parameter_map.get("window_extended"),
+            )
+        elif self.mechanism in {
+            TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE,
+            TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE,
+        }:
+            extra = (
+                self.parameter_map.get("beta_freq"),
+                self.parameter_map.get("beta_sil"),
+                self.parameter_map.get("base_rate"),
+                self.parameter_map.get("label_retries"),
+            )
+        elif self.mechanism is TaskMechanism.INTERACTION_RESPONSE:
+            extra = (
+                self.parameter_map.get("beta_u"),
+                self.parameter_map.get("beta_f"),
+                self.parameter_map.get("beta_s"),
+                self.parameter_map.get("beta_p"),
+                self.parameter_map.get("base_rate"),
+                self.parameter_map.get("invert"),
+            )
+        else:
+            extra = ()
+        return base + extra
 
     def _validate_database_interval(self) -> None:
         """Hard-check every task time lies inside the database calendar window.
@@ -296,14 +331,15 @@ class TaskPlan:
                     "observation rule max_timestamp must lie within the "
                     "database calendar interval"
                 )
-        window = self.parameter_map.get("window")
-        if window is not None and not (
-            0 <= window <= (self.db_end_seconds - self.db_start_seconds)
-        ):
-            raise ValueError(
-                "temporal aggregate window must fit inside the database "
-                "calendar interval"
-            )
+        for key in ("window", "window_extended"):
+            value = self.parameter_map.get(key)
+            if value is not None and not (
+                0 <= value <= (self.db_end_seconds - self.db_start_seconds)
+            ):
+                raise ValueError(
+                    f"temporal aggregate {key} must fit inside the database "
+                    "calendar interval"
+                )
 
     def _validate_mechanism_contract(self) -> None:
         if self.mechanism is TaskMechanism.RELATION_ATTRIBUTE:
@@ -361,6 +397,26 @@ class TaskPlan:
                 label.role is RouteRole.REQUIRED for label in self.route_supervision
             ):
                 raise ValueError("temporal aggregate requires an exact required path")
+        elif self.mechanism is TaskMechanism.INTERACTION_RESPONSE:
+            if self.prediction_type is not PredictionType.CLASSIFICATION:
+                raise ValueError("interaction response must be classification")
+            if None in (
+                self.foreign_key_id,
+                self.time_column_id,
+                self.row_cutoff_time_column_id,
+                self.source_column_id,
+            ):
+                raise ValueError(
+                    "interaction response requires FK, time, row cutoff and feature"
+                )
+            if self.target_column_id is None:
+                raise ValueError("interaction response requires target_column_id")
+            if self.target_column_id not in self.masked_column_ids:
+                raise ValueError("interaction response target must be masked")
+            if not any(
+                label.role is RouteRole.REQUIRED for label in self.route_supervision
+            ):
+                raise ValueError("interaction response requires an exact required path")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -375,6 +431,7 @@ class TaskPlan:
             "target_column_id": self.target_column_id,
             "source_column_id": self.source_column_id,
             "foreign_key_id": self.foreign_key_id,
+            "secondary_foreign_key_id": self.secondary_foreign_key_id,
             "time_column_id": self.time_column_id,
             "cutoff_time": self.cutoff_time,
             "horizon_end_time": self.horizon_end_time,
@@ -420,6 +477,7 @@ class TaskPlan:
             target_column_id=data.get("target_column_id"),
             source_column_id=data.get("source_column_id"),
             foreign_key_id=data.get("foreign_key_id"),
+            secondary_foreign_key_id=data.get("secondary_foreign_key_id"),
             time_column_id=data.get("time_column_id"),
             cutoff_time=data.get("cutoff_time"),
             horizon_end_time=data.get("horizon_end_time"),

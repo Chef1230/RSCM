@@ -254,7 +254,10 @@ value/weight lists.
 - `instance_generation`: schema selection, deterministic sharding, progress,
   overwrite behavior and project version.
 - `task`: tasks per database, mechanism weights, support/query sizing,
-  classification quality thresholds, and future cutoff/horizon ranges.
+  classification quality thresholds, future cutoff/horizon ranges,
+  history-gated soft-label propensity weights, temporal aggregate
+  window-regime mixing (short/long/repeated), and interaction-response beta
+  weight / invert-probability ranges.
 - `task_generation`: instance selection, deterministic sharding, progress,
   overwrite behavior and project version.
 - `rdbpfn_export`: task selection, train/validation split, compressed NPZ,
@@ -366,6 +369,32 @@ degenerate, leaking, or undersized tasks are rejected. By default the
 pipeline requires exactly `tasks_per_database` valid tasks and fails instead
 of silently reducing the count. Load artifacts with
 `rdb_prior.task.artifacts.load_task_artifact`.
+
+The `history_gated_future_inactive` / `history_gated_future_active` sub-modes
+emit soft propensity targets: each entity with prior history draws
+`Bernoulli(propensity)` where the propensity rises with pre-cutoff event
+frequency and falls with the silence since the last event (so recently-active,
+high-frequency entities are more likely "active"). The requested positive rate
+only sets a logistic base-rate intercept — a soft constraint, not a hard
+post-hoc match — and the exact labels are replayable from `plan.seed` plus the
+stored `beta_freq` / `beta_sil` / `base_rate` / `label_retries` parameters.
+`temporal_relational_aggregate` samples each task's aggregation window from a
+mixture of SHORT, LONG and REPEATED (short + long nested at the same cutoff,
+summed) regimes, storing `window` / `window_extended` / `window_regime`.
+
+`interaction_response` predicts, for each Event row interpreted as one interaction
+(`entity/user -> event -> item/context`, the item optional), whether that
+interaction produced a response. A row is excluded (`-1`) unless its entity has at
+least one prior interaction strictly before the row's own time; otherwise it draws
+`Bernoulli(sigmoid(z))` with `z = logit(base_rate) + beta_u*U_e + beta_f*F_e -
+beta_s*S_e + beta_p*P_e`, where `U_e` is a normalized entity feature, `F_e` /
+`P_e` are log1p historical interaction counts of the entity and (optional) item,
+and `S_e` is the normalized silence since the entity's last interaction. Each task
+samples its beta weights and flips the label (`invert`, positive means ignore)
+with `interaction_invert_probability`, so one mechanism covers both response/CTR
+and ignore. Labels replay exactly from `plan.seed` plus the stored
+`beta_u` / `beta_f` / `beta_s` / `beta_p` / `base_rate` / `invert` /
+`label_retries` parameters.
 
 The stage-04 output is directly loadable by RDBPFN:
 

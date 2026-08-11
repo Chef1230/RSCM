@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
 
 from rdb_prior.compilation.model import PhysicalSchema
 from rdb_prior.generation.model import DatabaseInstance
 from rdb_prior.instance.plan import InstancePlan
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.task.mechanisms import (
+    build_interaction_response_task,
     build_future_event_attribute_condition_task,
     build_future_event_existence_task,
     build_history_gated_future_activity_task,
@@ -16,6 +18,7 @@ from rdb_prior.task.mechanisms import (
     build_history_gated_future_active_task,
     build_relation_attribute_task,
     build_temporal_relational_aggregate_task,
+    interaction_candidates,
     future_event_attribute_candidates,
     future_event_candidates,
     relation_attribute_candidates,
@@ -31,7 +34,11 @@ _DEFAULT_MECHANISM_WEIGHTS = (
     (TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE, 0.07),
     (TaskMechanism.FUTURE_EVENT_ATTRIBUTE_CONDITION, 0.20),
     (TaskMechanism.TEMPORAL_RELATIONAL_AGGREGATE, 0.20),
+    (TaskMechanism.INTERACTION_RESPONSE, 0.15),
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -49,6 +56,25 @@ class TaskPlannerConfig:
     horizon_fraction_max: float = 0.3
     positive_rate_min: float = 0.2
     positive_rate_max: float = 0.8
+    history_gated_frequency_weight_min: float = 0.5
+    history_gated_frequency_weight_max: float = 3.0
+    history_gated_silence_weight_min: float = 0.5
+    history_gated_silence_weight_max: float = 3.0
+    window_repeated_probability: float = 0.25
+    window_short_probability: float = 0.5
+    window_short_fraction_min: float = 0.05
+    window_short_fraction_max: float = 0.15
+    window_long_fraction_min: float = 0.30
+    window_long_fraction_max: float = 0.60
+    interaction_u_weight_min: float = 0.25
+    interaction_u_weight_max: float = 2.0
+    interaction_frequency_weight_min: float = 0.5
+    interaction_frequency_weight_max: float = 3.0
+    interaction_silence_weight_min: float = 0.5
+    interaction_silence_weight_max: float = 3.0
+    interaction_item_weight_min: float = 0.5
+    interaction_item_weight_max: float = 3.0
+    interaction_invert_probability: float = 0.35
     max_attempts_per_database: int = 128
     require_full_task_count: bool = True
 
@@ -71,6 +97,65 @@ class TaskPlannerConfig:
             ("positive rate", self.positive_rate_min, self.positive_rate_max),
         ):
             _fraction_range(name, low, high)
+        for name, low, high in (
+            (
+                "history gated frequency weight",
+                self.history_gated_frequency_weight_min,
+                self.history_gated_frequency_weight_max,
+            ),
+            (
+                "history gated silence weight",
+                self.history_gated_silence_weight_min,
+                self.history_gated_silence_weight_max,
+            ),
+        ):
+            _weight_range(name, low, high)
+        _fraction_range(
+            "window short fraction",
+            self.window_short_fraction_min,
+            self.window_short_fraction_max,
+        )
+        _fraction_range(
+            "window long fraction",
+            self.window_long_fraction_min,
+            self.window_long_fraction_max,
+        )
+        for name, low, high in (
+            (
+                "interaction user weight",
+                self.interaction_u_weight_min,
+                self.interaction_u_weight_max,
+            ),
+            (
+                "interaction frequency weight",
+                self.interaction_frequency_weight_min,
+                self.interaction_frequency_weight_max,
+            ),
+            (
+                "interaction silence weight",
+                self.interaction_silence_weight_min,
+                self.interaction_silence_weight_max,
+            ),
+            (
+                "interaction item weight",
+                self.interaction_item_weight_min,
+                self.interaction_item_weight_max,
+            ),
+        ):
+            _weight_range(name, low, high)
+        for name, value in (
+            ("window repeated probability", self.window_repeated_probability),
+            ("window short probability", self.window_short_probability),
+            ("interaction invert probability", self.interaction_invert_probability),
+        ):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be numeric")
+            if not 0 < value < 1:
+                raise ValueError(f"{name} must be in (0, 1)")
+        if self.window_short_fraction_max > self.window_long_fraction_min:
+            raise ValueError(
+                "window_short_fraction_max must not exceed window_long_fraction_min"
+            )
         if not isinstance(self.require_full_task_count, bool):
             raise TypeError("require_full_task_count must be a boolean")
         if not isinstance(self.mechanism_weights, tuple) or not self.mechanism_weights:
@@ -111,6 +196,9 @@ class TaskPlanner:
             TaskMechanism.TEMPORAL_RELATIONAL_AGGREGATE: list(
                 temporal_aggregate_candidates(schema, database)
             ),
+            TaskMechanism.INTERACTION_RESPONSE: list(
+                interaction_candidates(schema, database)
+            ),
         }
         rng = runtime.numpy_rng("task-selection")
         for pool in pools.values():
@@ -118,6 +206,7 @@ class TaskPlanner:
         mechanisms, weights = zip(*self.config.mechanism_weights)
         generated: list[PlannedTask] = []
         signatures: set[tuple[object, ...]] = set()
+        calendar_rejections = 0
         for attempt in range(self.config.max_attempts_per_database):
             if len(generated) >= self.config.tasks_per_database:
                 break
@@ -169,6 +258,10 @@ class TaskPlanner:
                     horizon_fraction_max=self.config.horizon_fraction_max,
                     positive_rate_min=self.config.positive_rate_min,
                     positive_rate_max=min(self.config.positive_rate_max, 0.8),
+                    history_gated_frequency_weight_min=self.config.history_gated_frequency_weight_min,
+                    history_gated_frequency_weight_max=self.config.history_gated_frequency_weight_max,
+                    history_gated_silence_weight_min=self.config.history_gated_silence_weight_min,
+                    history_gated_silence_weight_max=self.config.history_gated_silence_weight_max,
                 )
             elif mechanism is TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE:
                 task = build_history_gated_future_active_task(
@@ -178,43 +271,114 @@ class TaskPlanner:
                     horizon_fraction_max=self.config.horizon_fraction_max,
                     positive_rate_min=self.config.positive_rate_min,
                     positive_rate_max=min(self.config.positive_rate_max, 0.8),
+                    history_gated_frequency_weight_min=self.config.history_gated_frequency_weight_min,
+                    history_gated_frequency_weight_max=self.config.history_gated_frequency_weight_max,
+                    history_gated_silence_weight_min=self.config.history_gated_silence_weight_min,
+                    history_gated_silence_weight_max=self.config.history_gated_silence_weight_max,
                 )
             elif mechanism is TaskMechanism.FUTURE_EVENT_ATTRIBUTE_CONDITION:
                 task = build_future_event_attribute_condition_task(
                     **common, positive_rate_min=self.config.positive_rate_min,
                     positive_rate_max=self.config.positive_rate_max,
                 )
+            elif mechanism is TaskMechanism.INTERACTION_RESPONSE:
+                task = build_interaction_response_task(
+                    **common, positive_rate_min=self.config.positive_rate_min,
+                    positive_rate_max=self.config.positive_rate_max,
+                    interaction_u_weight_min=self.config.interaction_u_weight_min,
+                    interaction_u_weight_max=self.config.interaction_u_weight_max,
+                    interaction_frequency_weight_min=self.config.interaction_frequency_weight_min,
+                    interaction_frequency_weight_max=self.config.interaction_frequency_weight_max,
+                    interaction_silence_weight_min=self.config.interaction_silence_weight_min,
+                    interaction_silence_weight_max=self.config.interaction_silence_weight_max,
+                    interaction_item_weight_min=self.config.interaction_item_weight_min,
+                    interaction_item_weight_max=self.config.interaction_item_weight_max,
+                    interaction_invert_probability=self.config.interaction_invert_probability,
+                )
             else:
                 task = build_temporal_relational_aggregate_task(
                     **common, cutoff_quantile_min=self.config.cutoff_quantile_min,
                     cutoff_quantile_max=self.config.cutoff_quantile_max,
-                    horizon_fraction_min=self.config.horizon_fraction_min,
-                    horizon_fraction_max=self.config.horizon_fraction_max,
+                    window_repeated_probability=self.config.window_repeated_probability,
+                    window_short_probability=self.config.window_short_probability,
+                    window_short_fraction_min=self.config.window_short_fraction_min,
+                    window_short_fraction_max=self.config.window_short_fraction_max,
+                    window_long_fraction_min=self.config.window_long_fraction_min,
+                    window_long_fraction_max=self.config.window_long_fraction_max,
                     positive_rate_min=self.config.positive_rate_min,
                     positive_rate_max=self.config.positive_rate_max,
                 )
-            if task is None or task.plan.signature in signatures:
+            if task is None:
+                continue
+            task = _bind_instance_calendar(task, instance_plan)
+            if task is None:
+                calendar_rejections += 1
+                continue
+            if task.plan.signature in signatures:
                 continue
             signatures.add(task.plan.signature)
-            if (
-                instance_plan is not None
-                and instance_plan.calendar_start_seconds is not None
-            ):
-                task = replace(
-                    task,
-                    plan=replace(
-                        task.plan,
-                        db_start_seconds=instance_plan.calendar_start_seconds,
-                        db_end_seconds=instance_plan.calendar_end_seconds,
-                    ),
-                )
             generated.append(task)
         if self.config.require_full_task_count and len(generated) != self.config.tasks_per_database:
+            detail = (
+                f"; rejected {calendar_rejections} candidate(s) whose time "
+                "fields were outside the instance calendar"
+                if calendar_rejections
+                else ""
+            )
             raise ValueError(
                 f"database {sample_id!r} yielded {len(generated)} valid tasks; "
-                f"required {self.config.tasks_per_database}"
+                f"required {self.config.tasks_per_database}{detail}"
             )
         return tuple(generated)
+
+
+def _bind_instance_calendar(
+    task: PlannedTask,
+    instance_plan: InstancePlan | None,
+) -> PlannedTask | None:
+    """Attach an instance calendar without allowing invalid task plans through.
+
+    Task mechanisms are intentionally generated from observed timestamps and
+    therefore do not need to know the instance plan while calculating labels.
+    Before adding the hard database bounds, however, reject a candidate whose
+    cutoff, horizon, observation rule, or aggregate window is inconsistent with
+    those bounds.  Rejecting lets the planner try another candidate; clipping
+    would silently change the task labels and data semantics.
+    """
+    if instance_plan is None or instance_plan.calendar_start_seconds is None:
+        return task
+    start = instance_plan.calendar_start_seconds
+    end = instance_plan.calendar_end_seconds
+    assert end is not None
+    plan = task.plan
+    invalid_fields: list[str] = []
+    for name in ("cutoff_time", "horizon_end_time"):
+        value = getattr(plan, name)
+        if value is not None and not start <= value <= end:
+            invalid_fields.append(name)
+    for index, rule in enumerate(plan.observation_rules):
+        if not start <= rule.max_timestamp <= end:
+            invalid_fields.append(f"observation_rules[{index}].max_timestamp")
+    window = plan.parameter_map.get("window")
+    if window is not None and not 0 <= window <= end - start:
+        invalid_fields.append("window")
+    if invalid_fields:
+        _LOGGER.debug(
+            "skipping task candidate %s for calendar [%d, %d]: %s",
+            plan.task_id,
+            start,
+            end,
+            ", ".join(invalid_fields),
+        )
+        return None
+    return replace(
+        task,
+        plan=replace(
+            plan,
+            db_start_seconds=start,
+            db_end_seconds=end,
+        ),
+    )
 
 
 def _fraction_range(name: str, low: float, high: float) -> None:
@@ -222,6 +386,14 @@ def _fraction_range(name: str, low: float, high: float) -> None:
         raise TypeError(f"{name} bounds must be numeric")
     if not 0 < low <= high < 1:
         raise ValueError(f"{name} bounds must satisfy 0 < min <= max < 1")
+
+
+def _weight_range(name: str, low: float, high: float) -> None:
+    """Range check for propensity weights (no ``< 1`` upper bound)."""
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (low, high)):
+        raise TypeError(f"{name} bounds must be numeric")
+    if not 0 < low <= high:
+        raise ValueError(f"{name} bounds must satisfy 0 < min <= max")
 
 
 def _normalize(values: list[float]) -> list[float]:
