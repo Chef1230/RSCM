@@ -274,6 +274,12 @@ inherit the global instance prior; missing roles use global weights with unit
 multipliers. For backward compatibility, an unconfigured Lookup role remains
 exogenous with a standard-normal root cause.
 
+Stage-03 task generation is parallelized by database. Set
+`task_generation.num_workers` in YAML or pass `rdb-prior task --jobs N`; the
+`TASK_JOBS` environment variable is also supported by `scripts/v1/03_task.sh`.
+Task artifacts are written by workers into disjoint `sample_id/task_id`
+directories, while the parent process writes the final manifest in input order.
+
 Connectivity, FK DAG, self-loop prohibition, parallel-FK prohibition, rank
 ordering, role-edge legality, Entity/Event presence and Bridge parent counts
 are hard validity contracts. They are deliberately not configurable switches.

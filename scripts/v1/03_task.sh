@@ -44,6 +44,9 @@ fi
 if [[ -n "${NUM_SHARDS:-}" ]]; then
   ARGS+=(--num-shards "${NUM_SHARDS}")
 fi
+if [[ -n "${TASK_JOBS:-${JOBS:-}}" ]]; then
+  ARGS+=(--jobs "${TASK_JOBS:-${JOBS}}")
+fi
 if [[ -n "${PROGRESS_EVERY:-}" ]]; then
   ARGS+=(--progress-every "${PROGRESS_EVERY}")
 fi

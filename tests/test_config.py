@@ -390,9 +390,13 @@ class SchemaConfigTests(unittest.TestCase):
         config_path = PROJECT_ROOT / "configs" / "refactor_v1.yaml"
         config = load_task_pipeline_config(
             config_path,
-            overrides=TaskConfigOverrides(tasks_per_database=4),
+            overrides=TaskConfigOverrides(
+                tasks_per_database=4,
+                num_workers=3,
+            ),
         )
         self.assertEqual(4, config.planner.tasks_per_database)
+        self.assertEqual(3, config.num_workers)
         self.assertEqual(7, len(config.planner.mechanism_weights))
 
         stdout = StringIO()
@@ -404,12 +408,15 @@ class SchemaConfigTests(unittest.TestCase):
                     str(config_path),
                     "--tasks-per-database",
                     "5",
+                    "--jobs",
+                    "4",
                     "--validate-config-only",
                 )
             )
         self.assertEqual(0, exit_code)
         resolved = json.loads(stdout.getvalue())
         self.assertEqual(5, resolved["planner"]["tasks_per_database"])
+        self.assertEqual(4, resolved["num_workers"])
 
     def test_rdbpfn_export_config_and_cli_overrides(self) -> None:
         config_path = PROJECT_ROOT / "configs" / "refactor_v1.yaml"

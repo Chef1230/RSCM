@@ -281,6 +281,7 @@ task_generation:
   start_index: 0
   shard_id: 0
   num_shards: 1
+  num_workers: 8
   progress_every: 100
   overwrite: false
   project_version: task-pipeline-v2

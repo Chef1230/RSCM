@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from rdb_prior.artifacts import load_instance_artifact, load_schema_artifact
 from rdb_prior.runtime import digest_config
@@ -27,6 +28,7 @@ class TaskPipelineConfig:
     start_index: int = 0
     shard_id: int = 0
     num_shards: int = 1
+    num_workers: int = 1
     overwrite: bool = False
     progress_every: int = 100
     project_version: str = "task-pipeline-v1"
@@ -44,7 +46,13 @@ class TaskPipelineConfig:
             raise TypeError("database_count must be an integer or None")
         if self.database_count is not None and self.database_count < 1:
             raise ValueError("database_count must be positive")
-        for name in ("start_index", "shard_id", "num_shards", "progress_every"):
+        for name in (
+            "start_index",
+            "shard_id",
+            "num_shards",
+            "num_workers",
+            "progress_every",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(f"{name} must be an integer")
@@ -52,6 +60,8 @@ class TaskPipelineConfig:
             raise ValueError("start_index and progress_every must be non-negative")
         if self.num_shards < 1 or not 0 <= self.shard_id < self.num_shards:
             raise ValueError("shard_id must satisfy 0 <= shard_id < num_shards")
+        if self.num_workers < 1:
+            raise ValueError("num_workers must be positive")
         if not isinstance(self.overwrite, bool):
             raise TypeError("overwrite must be a boolean")
         if not isinstance(self.planner, TaskPlannerConfig):
@@ -65,6 +75,7 @@ class TaskPipelineConfig:
             "start_index": self.start_index,
             "shard_id": self.shard_id,
             "num_shards": self.num_shards,
+            "num_workers": self.num_workers,
             "overwrite": self.overwrite,
             "progress_every": self.progress_every,
             "project_version": self.project_version,
@@ -94,6 +105,27 @@ class TaskPipelineResult:
         return len(self.artifact_paths)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TaskWorkItem:
+    index: int
+    entry: dict[str, Any]
+    instance_manifest: Path
+    output_root: Path
+    overwrite: bool
+    planner_config: TaskPlannerConfig
+    config_digest: str
+    project_version: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _TaskWorkResult:
+    index: int
+    sample_id: str
+    artifact_paths: tuple[Path, ...]
+    output_entries: tuple[dict[str, object], ...]
+    task_count: int
+
+
 def generate_tasks(
     config: TaskPipelineConfig,
     *,
@@ -120,113 +152,49 @@ def generate_tasks(
     ]
     configuration = config.to_dict()
     config_digest = digest_config(configuration)
-    planner = TaskPlanner(config.planner)
-    writer = TaskArtifactWriter(
-        output_root=config.output_root,
-        overwrite=config.overwrite,
-    )
-    artifact_paths: list[Path] = []
-    output_entries: list[dict[str, object]] = []
+    work_items = [
+        _TaskWorkItem(
+            index=index,
+            entry=entry,
+            instance_manifest=config.instance_manifest,
+            output_root=config.output_root,
+            overwrite=config.overwrite,
+            planner_config=config.planner,
+            config_digest=config_digest,
+            project_version=config.project_version,
+        )
+        for index, entry in selected
+    ]
     _LOGGER.info(
         "starting task pipeline: databases=%d tasks_per_database=%d "
-        "shard=%d/%d output=%s",
+        "workers=%d shard=%d/%d output=%s",
         len(selected),
         config.planner.tasks_per_database,
+        config.num_workers,
         config.shard_id,
         config.num_shards,
         config.output_root,
     )
 
-    for completed, (_index, entry) in enumerate(selected, start=1):
-        if not isinstance(entry, dict):
-            raise ValueError("instance manifest entry must be an object")
-        instance_path = (
-            config.instance_manifest.parent / entry["artifact"]
-        ).resolve()
-        instance_artifact = load_instance_artifact(instance_path)
-        schema_path = Path(instance_artifact.schema_artifact)
-        if not schema_path.is_absolute():
-            schema_path = (instance_path.parent / schema_path).resolve()
-        schema_artifact = load_schema_artifact(schema_path)
-        schema = schema_artifact.compilation.schema
-        database = instance_artifact.database
-        instance_report = validate_database_instance(
-            schema,
-            instance_artifact.plan,
-            database,
-        )
-        if not instance_report.is_valid:
-            issues = [
-                issue.to_dict()
-                for issue in instance_report.issues
-            ]
-            raise ValueError(
-                f"invalid database instance {instance_artifact.instance_id}: "
-                f"{issues}"
-            )
-        runtime = instance_artifact.runtime.restore_context().child("task")
-        tasks = planner.generate(
-            sample_id=instance_artifact.sample_id,
-            schema=schema,
-            database=database,
-            runtime=runtime,
-            instance_plan=instance_artifact.plan,
-        )
-        for task in tasks:
-            report = validate_task(schema, database, task)
-            if not report.is_valid:
-                raise ValueError(
-                    f"invalid task {task.plan.task_id}: "
-                    f"{[issue.code for issue in report.issues]}"
-                )
-            task_runtime = runtime.child(task.plan.task_id)
-            runtime_record = task_runtime.record(
-                project_version=config.project_version,
-                config_digest=config_digest,
-                metadata={
-                    "stage": "relational_task",
-                    "sample_id": instance_artifact.sample_id,
-                    "task_id": task.plan.task_id,
-                    "mechanism": task.plan.mechanism.value,
-                },
-            )
-            artifact_path = writer.commit(
-                sample_id=instance_artifact.sample_id,
-                instance_artifact=str(instance_path),
-                schema_artifact=str(schema_path),
-                runtime=runtime_record,
-                task=task,
-                report=report,
-            )
-            artifact_paths.append(artifact_path)
-            _LOGGER.debug(
-                "task artifact committed: task_id=%s mechanism=%s path=%s",
-                task.plan.task_id,
-                task.plan.mechanism.value,
-                artifact_path,
-            )
-            output_entries.append(
-                {
-                    "sample_id": instance_artifact.sample_id,
-                    "task_id": task.plan.task_id,
-                    "artifact": artifact_path.relative_to(
-                        config.output_root
-                    ).as_posix(),
-                    "instance_artifact": str(instance_path),
-                    "schema_id": schema.schema_id,
-                    "mechanism": task.plan.mechanism.value,
-                    "prediction_type": task.plan.prediction_type.value,
-                    "support_count": len(task.data.support_row_ids),
-                    "query_count": len(task.data.query_row_ids),
-                }
-            )
-        if progress is not None:
-            progress(
-                completed,
-                len(selected),
-                instance_artifact.sample_id,
-                len(tasks),
-            )
+    results = _run_task_work_items(
+        work_items,
+        num_workers=config.num_workers,
+        progress=progress,
+    )
+    artifact_paths = [
+        artifact_path
+        for result in results
+        for artifact_path in result.artifact_paths
+    ]
+    output_entries = [
+        output_entry
+        for result in results
+        for output_entry in result.output_entries
+    ]
+    writer = TaskArtifactWriter(
+        output_root=config.output_root,
+        overwrite=config.overwrite,
+    )
 
     manifest_path = writer.write_manifest(
         configuration=configuration,
@@ -252,6 +220,136 @@ def generate_tasks(
         manifest_path=manifest_path,
         artifact_paths=tuple(artifact_paths),
         database_count=len(selected),
+    )
+
+
+def _run_task_work_items(
+    work_items: list[_TaskWorkItem],
+    *,
+    num_workers: int,
+    progress: Callable[[int, int, str, int], None] | None,
+) -> list[_TaskWorkResult]:
+    if not work_items:
+        return []
+    completed = 0
+    results: list[_TaskWorkResult] = []
+    if num_workers == 1:
+        for item in work_items:
+            result = _generate_one_database_tasks(item)
+            results.append(result)
+            completed += 1
+            if progress is not None:
+                progress(
+                    completed,
+                    len(work_items),
+                    result.sample_id,
+                    result.task_count,
+                )
+    else:
+        max_workers = min(num_workers, len(work_items))
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_generate_one_database_tasks, item): item
+                for item in work_items
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                completed += 1
+                if progress is not None:
+                    progress(
+                        completed,
+                        len(work_items),
+                        result.sample_id,
+                        result.task_count,
+                    )
+    return sorted(results, key=lambda result: result.index)
+
+
+def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
+    if not isinstance(item.entry, dict):
+        raise ValueError("instance manifest entry must be an object")
+    instance_path = (item.instance_manifest.parent / item.entry["artifact"]).resolve()
+    instance_artifact = load_instance_artifact(instance_path)
+    schema_path = Path(instance_artifact.schema_artifact)
+    if not schema_path.is_absolute():
+        schema_path = (instance_path.parent / schema_path).resolve()
+    schema_artifact = load_schema_artifact(schema_path)
+    schema = schema_artifact.compilation.schema
+    database = instance_artifact.database
+    instance_report = validate_database_instance(
+        schema,
+        instance_artifact.plan,
+        database,
+    )
+    if not instance_report.is_valid:
+        issues = [issue.to_dict() for issue in instance_report.issues]
+        raise ValueError(
+            f"invalid database instance {instance_artifact.instance_id}: "
+            f"{issues}"
+        )
+    runtime = instance_artifact.runtime.restore_context().child("task")
+    tasks = TaskPlanner(item.planner_config).generate(
+        sample_id=instance_artifact.sample_id,
+        schema=schema,
+        database=database,
+        runtime=runtime,
+        instance_plan=instance_artifact.plan,
+    )
+    writer = TaskArtifactWriter(
+        output_root=item.output_root,
+        overwrite=item.overwrite,
+    )
+    artifact_paths: list[Path] = []
+    output_entries: list[dict[str, object]] = []
+    for task in tasks:
+        report = validate_task(schema, database, task)
+        if not report.is_valid:
+            raise ValueError(
+                f"invalid task {task.plan.task_id}: "
+                f"{[issue.code for issue in report.issues]}"
+            )
+        task_runtime = runtime.child(task.plan.task_id)
+        runtime_record = task_runtime.record(
+            project_version=item.project_version,
+            config_digest=item.config_digest,
+            metadata={
+                "stage": "relational_task",
+                "sample_id": instance_artifact.sample_id,
+                "task_id": task.plan.task_id,
+                "mechanism": task.plan.mechanism.value,
+            },
+        )
+        artifact_path = writer.commit(
+            sample_id=instance_artifact.sample_id,
+            instance_artifact=str(instance_path),
+            schema_artifact=str(schema_path),
+            runtime=runtime_record,
+            task=task,
+            report=report,
+        )
+        artifact_paths.append(artifact_path)
+        output_entries.append(
+            {
+                "sample_id": instance_artifact.sample_id,
+                "task_id": task.plan.task_id,
+                "artifact": artifact_path.relative_to(
+                    item.output_root
+                ).as_posix(),
+                "instance_artifact": str(instance_path),
+                "schema_id": schema.schema_id,
+                "mechanism": task.plan.mechanism.value,
+                "prediction_type": task.plan.prediction_type.value,
+                "support_count": len(task.data.support_row_ids),
+                "query_count": len(task.data.query_row_ids),
+            }
+        )
+    return _TaskWorkResult(
+        index=item.index,
+        sample_id=instance_artifact.sample_id,
+        artifact_paths=tuple(artifact_paths),
+        output_entries=tuple(output_entries),
+        task_count=len(tasks),
     )
 
 

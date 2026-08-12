@@ -173,6 +173,14 @@ def _build_parser() -> argparse.ArgumentParser:
     task.add_argument("--start-index", type=int, default=None)
     task.add_argument("--shard-id", type=int, default=None)
     task.add_argument("--num-shards", type=int, default=None)
+    task.add_argument(
+        "--jobs",
+        "--workers",
+        dest="num_workers",
+        type=int,
+        default=None,
+        help="override task_generation.num_workers",
+    )
     task.add_argument("--progress-every", type=int, default=None)
     task.add_argument(
         "--overwrite",
@@ -534,6 +542,7 @@ def _run_task(args: argparse.Namespace) -> int:
             start_index=args.start_index,
             shard_id=args.shard_id,
             num_shards=args.num_shards,
+            num_workers=args.num_workers,
             progress_every=args.progress_every,
             overwrite=args.overwrite,
         ),
@@ -580,6 +589,7 @@ def _run_task(args: argparse.Namespace) -> int:
             {
                 "database_count": result.database_count,
                 "task_count": result.task_count,
+                "num_workers": config.num_workers,
                 "output_root": str(result.output_root),
                 "manifest": str(result.manifest_path),
             },

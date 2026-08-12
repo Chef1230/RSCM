@@ -1166,10 +1166,26 @@ class TaskGenerationTests(unittest.TestCase):
                     ),
                 )
             )
+            serial_result = generate_tasks(
+                TaskPipelineConfig(
+                    instance_manifest=instance_result.manifest_path,
+                    output_root=root / "task_serial",
+                    num_workers=1,
+                    planner=TaskPlannerConfig(
+                        tasks_per_database=2,
+                        mechanism_weights=(
+                            (TaskMechanism.RELATION_ATTRIBUTE, 1.0),
+                        ),
+                        min_support_rows=8,
+                        min_query_rows=4,
+                    ),
+                )
+            )
             result = generate_tasks(
                 TaskPipelineConfig(
                     instance_manifest=instance_result.manifest_path,
                     output_root=root / "task",
+                    num_workers=2,
                     planner=TaskPlannerConfig(
                         tasks_per_database=2,
                         mechanism_weights=(
@@ -1183,6 +1199,30 @@ class TaskGenerationTests(unittest.TestCase):
 
             self.assertEqual(2, result.database_count)
             self.assertEqual(4, result.task_count)
+            self.assertEqual(serial_result.task_count, result.task_count)
+            for serial_path, parallel_path in zip(
+                serial_result.artifact_paths,
+                result.artifact_paths,
+            ):
+                serial_task = load_task_artifact(serial_path)
+                parallel_task = load_task_artifact(parallel_path)
+                self.assertEqual(serial_task.task.plan, parallel_task.task.plan)
+                np.testing.assert_array_equal(
+                    serial_task.task.data.support_row_ids,
+                    parallel_task.task.data.support_row_ids,
+                )
+                np.testing.assert_array_equal(
+                    serial_task.task.data.query_row_ids,
+                    parallel_task.task.data.query_row_ids,
+                )
+                np.testing.assert_array_equal(
+                    serial_task.task.data.support_labels,
+                    parallel_task.task.data.support_labels,
+                )
+                np.testing.assert_array_equal(
+                    serial_task.task.data.query_labels,
+                    parallel_task.task.data.query_labels,
+                )
             manifest = json.loads(
                 result.manifest_path.read_text(encoding="utf-8")
             )

@@ -108,6 +108,7 @@ class TaskConfigOverrides:
     start_index: int | None = None
     shard_id: int | None = None
     num_shards: int | None = None
+    num_workers: int | None = None
     progress_every: int | None = None
     overwrite: bool | None = None
 
@@ -651,6 +652,7 @@ _TASK_GENERATION_OPTIONS = {
     "start_index",
     "shard_id",
     "num_shards",
+    "num_workers",
     "progress_every",
     "overwrite",
     "project_version",
@@ -939,6 +941,10 @@ def load_task_pipeline_config(
             num_shards=_override(
                 cli.num_shards,
                 generation.get("num_shards", 1),
+            ),
+            num_workers=_override(
+                cli.num_workers,
+                generation.get("num_workers", 1),
             ),
             progress_every=_override(
                 cli.progress_every,
