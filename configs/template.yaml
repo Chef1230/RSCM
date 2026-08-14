@@ -466,16 +466,16 @@ rdbpfn_export:
   min_validation_rows: 8
   compress: true
   progress_every: 100
-  overwrite: false
+  overwrite: true
   project_version: rdbpfn-export-v1
 
   # --- 可选: DFS 预处理 + H5 打包 (依赖 ../RDBPFN) -------------------------
-  h5_enabled: false              # true 时在 DBB 导出后执行 H5 分支
+  h5_enabled: true              # true 时在 DBB 导出后执行 H5 分支
   h5_output: null                # null => <output_root>/rdbpfn/rdbpfn_tasks.h5
   rdbpfn_preprocessing_root: ../RDBPFN/data_preprocessing
   h5_run_dfs: true               # false = 仅打包已有 rdbpfn-processed 目录
-  dfs_depth: 1
-  dfs_jobs: 24
+  dfs_depth: 2
+  dfs_jobs: 32
   h5_total_rows: 600
   h5_max_columns: 60
   h5_seed: 42
