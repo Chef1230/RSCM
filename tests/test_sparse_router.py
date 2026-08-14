@@ -127,7 +127,10 @@ class SparseRouterTests(unittest.TestCase):
                 label.role
                 for label in raw.task_artifact.task.plan.route_supervision
             }
-            self.assertIn(RouteRole.OPTIONAL, roles)
+            # Relation-attribute tasks have one required path; optional paths
+            # are reserved for mechanisms with an explicitly optional
+            # relation, such as the item side of interaction_response.
+            self.assertNotIn(RouteRole.OPTIONAL, roles)
             self.assertIn(RouteRole.DISTRACTOR, roles)
 
     def test_end_to_end_loss_backward_and_query_label_isolation(self) -> None:
