@@ -5,11 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import logging
 
+import numpy as np
+
 from rdb_prior.compilation.model import PhysicalSchema
 from rdb_prior.generation.model import DatabaseInstance
 from rdb_prior.instance.plan import InstancePlan
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.task.mechanisms import (
+    build_composite_relational_classification_task,
     build_interaction_response_task,
     build_future_event_attribute_condition_task,
     build_future_event_existence_task,
@@ -18,13 +21,18 @@ from rdb_prior.task.mechanisms import (
     build_history_gated_future_active_task,
     build_relation_attribute_task,
     build_temporal_relational_aggregate_task,
+    generate_composite_candidates,
     interaction_candidates,
     future_event_attribute_candidates,
     future_event_candidates,
     relation_attribute_candidates,
     temporal_aggregate_candidates,
 )
-from rdb_prior.task.model import PlannedTask, TaskMechanism
+from rdb_prior.task.model import (
+    CompositeFamily,
+    PlannedTask,
+    TaskMechanism,
+)
 
 
 _DEFAULT_MECHANISM_WEIGHTS = (
@@ -39,6 +47,16 @@ _DEFAULT_MECHANISM_WEIGHTS = (
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_DEFAULT_COMPOSITE_FAMILY_WEIGHTS = (
+    (CompositeFamily.FILTERED_AGGREGATE, 0.25),
+    (CompositeFamily.COUNT_DISTINCT, 0.15),
+    (CompositeFamily.QUANTIFIED_EVENT, 0.15),
+    (CompositeFamily.MULTI_SOURCE, 0.15),
+    (CompositeFamily.MULTI_HOP_FILTERED, 0.15),
+    (CompositeFamily.HISTORY_CONDITIONED_FUTURE, 0.15),
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -75,6 +93,12 @@ class TaskPlannerConfig:
     interaction_item_weight_min: float = 0.5
     interaction_item_weight_max: float = 3.0
     interaction_invert_probability: float = 0.35
+    composite_family_weights: tuple[
+        tuple[CompositeFamily, float], ...
+    ] = _DEFAULT_COMPOSITE_FAMILY_WEIGHTS
+    composite_max_path_depth: int = 3
+    composite_max_predicates: int = 2
+    composite_candidate_limit: int = 256
     max_attempts_per_database: int = 128
     require_full_task_count: bool = True
 
@@ -158,6 +182,37 @@ class TaskPlannerConfig:
             )
         if not isinstance(self.require_full_task_count, bool):
             raise TypeError("require_full_task_count must be a boolean")
+        for name in ("composite_max_path_depth", "composite_candidate_limit"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{name} must be positive")
+        if isinstance(self.composite_max_predicates, bool) or not isinstance(
+            self.composite_max_predicates, int
+        ):
+            raise TypeError("composite_max_predicates must be an integer")
+        if self.composite_max_predicates < 0:
+            raise ValueError("composite_max_predicates must be non-negative")
+        if (
+            not isinstance(self.composite_family_weights, tuple)
+            or not self.composite_family_weights
+        ):
+            raise ValueError(
+                "composite_family_weights must be a non-empty tuple"
+            )
+        families = tuple(item[0] for item in self.composite_family_weights)
+        if len(set(families)) != len(families):
+            raise ValueError(
+                "composite_family_weights contains duplicate families"
+            )
+        for family, weight in self.composite_family_weights:
+            if not isinstance(family, CompositeFamily):
+                raise TypeError(
+                    "composite_family_weights keys must be CompositeFamily"
+                )
+            if weight <= 0:
+                raise ValueError("composite family weights must be positive")
         if not isinstance(self.mechanism_weights, tuple) or not self.mechanism_weights:
             raise ValueError("mechanism_weights must be a non-empty tuple")
         mechanisms = tuple(item[0] for item in self.mechanism_weights)
@@ -200,6 +255,12 @@ class TaskPlanner:
                 interaction_candidates(schema, database)
             ),
         }
+        composite_pools = _composite_candidate_pools(schema, database, self.config)
+        pools[TaskMechanism.RELATIONAL_CLASSIFICATION] = [
+            candidate
+            for candidates in composite_pools.values()
+            for candidate in candidates
+        ]
         rng = runtime.numpy_rng("task-selection")
         for pool in pools.values():
             rng.shuffle(pool)
@@ -295,6 +356,21 @@ class TaskPlanner:
                     interaction_item_weight_max=self.config.interaction_item_weight_max,
                     interaction_invert_probability=self.config.interaction_invert_probability,
                 )
+            elif mechanism is TaskMechanism.RELATIONAL_CLASSIFICATION:
+                task = _generate_composite_task(
+                    task_id=common["task_id"], sample_id=common["sample_id"],
+                    schema=schema, database=database, seed=common["seed"],
+                    support_fraction=common["support_fraction"],
+                    min_support_rows=common["min_support_rows"],
+                    min_query_rows=common["min_query_rows"],
+                    min_class_count_per_split=common["min_class_count_per_split"],
+                    composite_pools=composite_pools,
+                    family_weights=dict(self.config.composite_family_weights),
+                    rng=rng,
+                    max_predicates=self.config.composite_max_predicates,
+                    positive_rate_min=self.config.positive_rate_min,
+                    positive_rate_max=self.config.positive_rate_max,
+                )
             else:
                 task = build_temporal_relational_aggregate_task(
                     **common, cutoff_quantile_min=self.config.cutoff_quantile_min,
@@ -332,6 +408,88 @@ class TaskPlanner:
         return tuple(generated)
 
 
+def _composite_candidate_pools(
+    schema: PhysicalSchema,
+    database: DatabaseInstance,
+    config: TaskPlannerConfig,
+) -> dict[CompositeFamily, list[object]]:
+    """Composite candidate skeletons grouped by family."""
+    families = tuple(family for family, _weight in config.composite_family_weights)
+    candidates = generate_composite_candidates(
+        schema,
+        database,
+        families=families,
+        max_path_depth=config.composite_max_path_depth,
+        candidate_limit=config.composite_candidate_limit,
+    )
+    pools: dict[CompositeFamily, list[object]] = {}
+    for candidate in candidates:
+        pools.setdefault(candidate.family, []).append(candidate)
+    return pools
+
+
+def _generate_composite_task(
+    *,
+    task_id: str,
+    sample_id: str,
+    schema: PhysicalSchema,
+    database: DatabaseInstance,
+    seed: int,
+    support_fraction: float,
+    min_support_rows: int,
+    min_query_rows: int,
+    min_class_count_per_split: int,
+    composite_pools: dict[CompositeFamily, list[object]],
+    family_weights: dict[CompositeFamily, float],
+    rng: np.random.Generator,
+    max_predicates: int,
+    positive_rate_min: float,
+    positive_rate_max: float,
+) -> PlannedTask | None:
+    """Build one composite task, trying families in weighted order.
+
+    When a sampled family's candidates are infeasible (e.g. window out of
+    range, degenerate labels), later families are tried within the same
+    attempt so the planner does not waste attempts on an exhausted family.
+    """
+    families = [
+        family for family, candidates in composite_pools.items() if candidates
+    ]
+    if not families:
+        return None
+    weights = [family_weights[family] for family in families]
+    order = rng.choice(
+        len(families), size=len(families), replace=False, p=_normalize(weights)
+    )
+    builds = 0
+    for family_index in order:
+        family = families[int(family_index)]
+        candidates = list(composite_pools[family])
+        rng.shuffle(candidates)
+        for candidate in candidates:
+            if builds >= 64:
+                return None
+            builds += 1
+            task = build_composite_relational_classification_task(
+                task_id=task_id,
+                sample_id=sample_id,
+                schema=schema,
+                database=database,
+                candidate=candidate,
+                seed=seed,
+                support_fraction=support_fraction,
+                min_support_rows=min_support_rows,
+                min_query_rows=min_query_rows,
+                min_class_count_per_split=min_class_count_per_split,
+                positive_rate_min=positive_rate_min,
+                positive_rate_max=positive_rate_max,
+                max_predicates=max_predicates,
+            )
+            if task is not None:
+                return task
+    return None
+
+
 def _bind_instance_calendar(
     task: PlannedTask,
     instance_plan: InstancePlan | None,
@@ -362,6 +520,17 @@ def _bind_instance_calendar(
     window = plan.parameter_map.get("window")
     if window is not None and not 0 <= window <= end - start:
         invalid_fields.append("window")
+    if plan.composite_spec is not None:
+        aggregates = list(plan.composite_spec.label_aggregates)
+        if plan.composite_spec.eligibility_aggregate is not None:
+            aggregates.append(plan.composite_spec.eligibility_aggregate)
+        for index, aggregate in enumerate(aggregates):
+            if plan.cutoff_time is None:
+                continue
+            lower = plan.cutoff_time + aggregate.window_start
+            upper = plan.cutoff_time + aggregate.window_end
+            if not (start <= lower <= end and start <= upper <= end):
+                invalid_fields.append(f"composite window[{index}]")
     if invalid_fields:
         _LOGGER.debug(
             "skipping task candidate %s for calendar [%d, %d]: %s",

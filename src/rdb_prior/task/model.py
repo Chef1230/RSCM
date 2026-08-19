@@ -9,6 +9,22 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from rdb_prior.task.composite import (
+    AggregateOperator,
+    AggregateSpec,
+    CompositeTaskSpec,
+)
+
+# Re-exported composite enums for callers that previously imported them from
+# the task model module.
+from rdb_prior.task.composite import (
+    CombineOperator,
+    CompareOperator,
+    CompositeFamily,
+    LabelOperator,
+    PredicateSpec,
+)
+
 
 class TaskMechanism(str, Enum):
     ENTITY_FUTURE_EVENT_EXISTENCE = "entity_future_event_existence"
@@ -19,18 +35,12 @@ class TaskMechanism(str, Enum):
     FUTURE_EVENT_ATTRIBUTE_CONDITION = "future_event_attribute_condition"
     TEMPORAL_RELATIONAL_AGGREGATE = "temporal_relational_aggregate"
     INTERACTION_RESPONSE = "interaction_response"
+    RELATIONAL_CLASSIFICATION = "relational_classification"
 
 
 class ClassificationKind(str, Enum):
     BINARY = "binary"
     CATEGORICAL = "categorical"
-
-
-class AggregateOperator(str, Enum):
-    COUNT = "count"
-    SUM = "sum"
-    MAX = "max"
-    MIN = "min"
 
 class PredictionType(str, Enum):
     CLASSIFICATION = "classification"
@@ -135,6 +145,7 @@ class TaskPlan:
     parameters: tuple[tuple[str, float], ...] = ()
     db_start_seconds: int | None = None
     db_end_seconds: int | None = None
+    composite_spec: CompositeTaskSpec | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -219,6 +230,10 @@ class TaskPlan:
             raise ValueError(
                 "row-specific cutoff requires at least one observation rule"
             )
+        if self.composite_spec is not None and not isinstance(
+            self.composite_spec, CompositeTaskSpec
+        ):
+            raise TypeError("composite_spec must be CompositeTaskSpec or None")
         if not isinstance(self.route_supervision, tuple) or not all(
             isinstance(label, RoutePathLabel)
             for label in self.route_supervision
@@ -258,10 +273,9 @@ class TaskPlan:
                 if label.role is RouteRole.REQUIRED
             ),
         )
-        # Window / propensity parameters are not part of ``parameters`` in the
-        # base signature, so different window regimes or soft-label weights on
-        # the same candidate would otherwise collide in planner dedup. Append
-        # them per mechanism only (signature is used solely for dedup).
+        # Window / label-generation parameters are not part of parameters
+        # in the base signature, so tasks on the same candidate would otherwise
+        # collide in planner dedup. Append the mechanism-specific values only.
         if self.mechanism is TaskMechanism.TEMPORAL_RELATIONAL_AGGREGATE:
             extra = (
                 self.parameter_map.get("window"),
@@ -272,10 +286,9 @@ class TaskPlan:
             TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE,
         }:
             extra = (
-                self.parameter_map.get("beta_freq"),
-                self.parameter_map.get("beta_sil"),
-                self.parameter_map.get("base_rate"),
-                self.parameter_map.get("label_retries"),
+                self.parameter_map.get("cutoff_quantile"),
+                self.parameter_map.get("support_fraction"),
+                self.requested_positive_rate,
             )
         elif self.mechanism is TaskMechanism.INTERACTION_RESPONSE:
             extra = (
@@ -288,6 +301,11 @@ class TaskPlan:
             )
         else:
             extra = ()
+        # Composite tasks are fully described by their composite spec; include
+        # its canonical content so distinct composite tasks never collide in
+        # planner dedup even when their scalar fields coincide.
+        if self.composite_spec is not None:
+            extra += (self.composite_spec.canonical(),)
         return base + extra
 
     def _validate_database_interval(self) -> None:
@@ -417,6 +435,27 @@ class TaskPlan:
                 label.role is RouteRole.REQUIRED for label in self.route_supervision
             ):
                 raise ValueError("interaction response requires an exact required path")
+        elif self.mechanism is TaskMechanism.RELATIONAL_CLASSIFICATION:
+            if self.prediction_type is not PredictionType.CLASSIFICATION:
+                raise ValueError("relational classification must be classification")
+            if self.composite_spec is None:
+                raise ValueError(
+                    "relational classification requires composite_spec"
+                )
+            if self.target_column_id is None:
+                raise ValueError(
+                    "relational classification requires target_column_id"
+                )
+            if self.target_column_id not in self.masked_column_ids:
+                raise ValueError(
+                    "relational classification target must be masked"
+                )
+            if not any(
+                label.role is RouteRole.REQUIRED for label in self.route_supervision
+            ):
+                raise ValueError(
+                    "relational classification requires an exact required path"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -457,6 +496,11 @@ class TaskPlan:
             "parameters": dict(self.parameters),
             "db_start_seconds": self.db_start_seconds,
             "db_end_seconds": self.db_end_seconds,
+            "composite_spec": (
+                None
+                if self.composite_spec is None
+                else self.composite_spec.to_dict()
+            ),
         }
 
     @classmethod
@@ -511,6 +555,11 @@ class TaskPlan:
             parameters=tuple(data.get("parameters", {}).items()),
             db_start_seconds=data.get("db_start_seconds"),
             db_end_seconds=data.get("db_end_seconds"),
+            composite_spec=(
+                None
+                if data.get("composite_spec") is None
+                else CompositeTaskSpec.from_dict(data["composite_spec"])
+            ),
         )
 
 
@@ -591,4 +640,11 @@ __all__ = [
     "TaskPlan",
     "TaskData",
     "PlannedTask",
+    "CompositeFamily",
+    "CompareOperator",
+    "CombineOperator",
+    "LabelOperator",
+    "PredicateSpec",
+    "AggregateSpec",
+    "CompositeTaskSpec",
 ]

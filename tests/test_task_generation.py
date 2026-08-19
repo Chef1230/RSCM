@@ -304,8 +304,8 @@ class TaskGenerationTests(unittest.TestCase):
         """Shared test body for the two history-gated sub-modes.
 
         Both sub-modes restrict samples to entities with prior history and
-        emit stochastic frequency/recency-driven propensity labels; the two
-        only differ in which group is the positive class.
+        derive labels from actual events in the future window; the two only
+        differ in which group is the positive class.
         """
         planner = TaskPlanner(
             TaskPlannerConfig(
@@ -336,6 +336,30 @@ class TaskGenerationTests(unittest.TestCase):
 
             expected = mechanism_labels(schema, database, plan)
             history_mask = self._history_mask(schema, database, plan)
+            fk = next(
+                foreign_key
+                for foreign_key in schema.foreign_keys
+                if foreign_key.foreign_key_id == plan.foreign_key_id
+            )
+            event = database.table(plan.source_table_id)
+            times = event.column(plan.time_column_id or "")
+            assignments = event.column(fk.child_column_id)
+            has_future = np.zeros(len(history_mask), dtype=bool)
+            valid = assignments >= 0
+            has_future[
+                np.unique(assignments[
+                    valid
+                    & (times > plan.cutoff_time)
+                    & (times <= plan.horizon_end_time)
+                ])
+            ] = True
+            actual = np.full(len(history_mask), -1, dtype=np.int8)
+            if mechanism is TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE:
+                actual[history_mask] = has_future[history_mask].astype(np.int8)
+            else:
+                actual[history_mask] = (~has_future[history_mask]).astype(np.int8)
+            # The label must be a direct function of the real future window.
+            np.testing.assert_array_equal(expected, actual)
             # Entities without history are excluded from the sample.
             supervised = np.concatenate(
                 (task.data.support_row_ids, task.data.query_row_ids)
@@ -359,8 +383,7 @@ class TaskGenerationTests(unittest.TestCase):
             )
 
             # The task's stored labels agree with the recompute path, and the
-            # plan round-trips through serialization without shifting the
-            # label stream.
+            # plan round-trips through serialization without changing labels.
             np.testing.assert_array_equal(
                 task.data.support_labels,
                 expected[task.data.support_row_ids],
@@ -395,70 +418,34 @@ class TaskGenerationTests(unittest.TestCase):
             TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE
         )
 
-    def _history_gated_covariates(
-        self,
-        schema: PhysicalSchema,
-        database: DatabaseInstance,
-        plan: TaskPlan,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Independent frequency/recency covariates per entity.
-
-        Computed from raw event rows up to the cutoff; the only deterministic
-        inputs to the stochastic propensity label.
-        """
-        fk = next(
-            foreign_key
-            for foreign_key in schema.foreign_keys
-            if foreign_key.foreign_key_id == plan.foreign_key_id
-        )
-        event = database.table(plan.source_table_id)
-        times = event.column(plan.time_column_id or "")
-        assignments = event.column(fk.child_column_id)
-        entity_count = database.table(plan.target_table_id).row_count
-        history = (assignments >= 0) & (times <= plan.cutoff_time)
-        counts = np.bincount(assignments[history], minlength=entity_count)
-        last = np.full(entity_count, -1, dtype=np.int64)
-        np.maximum.at(last, assignments[history], times[history])
-        history_mask = counts > 0
-        span = max(1, int(times.max()) - int(times.min()))
-        freq_norm = np.zeros(entity_count, dtype=np.float64)
-        silence = np.zeros(entity_count, dtype=np.float64)
-        freq_norm[history_mask] = (
-            np.log1p(counts[history_mask]) / np.log1p(counts.max())
-        )
-        silence[history_mask] = np.clip(
-            (plan.cutoff_time - last[history_mask]) / span, 0.0, 1.0
-        )
-        return history_mask, freq_norm, silence
-
-    def test_history_gated_soft_labels_favor_recent_high_frequency(self) -> None:
-        """High-frequency, recently-active entities must be more likely 1.
-
-        ``HISTORY_GATED_FUTURE_ACTIVE`` (positive = retained) should assign a
-        higher positive rate to engaged entities (high pre-cutoff frequency,
-        low silence) than to dormant ones (low frequency, long silence).
-        """
-        engaged_positive = 0
-        engaged_total = 0
-        dormant_positive = 0
-        dormant_total = 0
-        tasks = 0
-        for index in range(20):
-            sample_id = f"hg_soft_favor_{index}"
-            runtime, schema, database = self._database(
-                sample_id, min_tables=5, max_tables=7
-            )
-            candidates = future_event_candidates(schema)
-            if not candidates:
-                continue
-            for seed in range(40):
-                task = build_history_gated_future_active_task(
-                    task_id=f"hg_soft_favor_{index}_{seed}",
+    def test_history_gated_labels_use_the_future_window(self) -> None:
+        """Labels must be the observed future-event result, not a propensity draw."""
+        checked = 0
+        for mechanism, build in (
+            (
+                TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE,
+                build_history_gated_future_inactive_task,
+            ),
+            (
+                TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE,
+                build_history_gated_future_active_task,
+            ),
+        ):
+            for index in range(20):
+                sample_id = f"hg_future_labels_{mechanism.value}_{index}"
+                runtime, schema, database = self._database(
+                    sample_id, min_tables=5, max_tables=7
+                )
+                candidates = future_event_candidates(schema)
+                if not candidates:
+                    continue
+                task = build(
+                    task_id=f"hg_future_labels_{mechanism.value}_{index}",
                     sample_id=sample_id,
                     schema=schema,
                     database=database,
                     candidate=candidates[0],
-                    seed=runtime.seed("hg-soft-favor", seed),
+                    seed=runtime.seed("hg-future-labels"),
                     support_fraction=0.7,
                     min_support_rows=4,
                     min_query_rows=2,
@@ -469,89 +456,49 @@ class TaskGenerationTests(unittest.TestCase):
                     horizon_fraction_max=0.3,
                     positive_rate_min=0.2,
                     positive_rate_max=0.8,
+                    history_gated_frequency_weight_min=0.1,
+                    history_gated_frequency_weight_max=10.0,
+                    history_gated_silence_weight_min=0.1,
+                    history_gated_silence_weight_max=10.0,
                 )
                 if task is None:
                     continue
                 plan = task.plan
                 labels = mechanism_labels(schema, database, plan)
-                _, freq_norm, silence = self._history_gated_covariates(
-                    schema, database, plan
+                fk = next(
+                    foreign_key
+                    for foreign_key in schema.foreign_keys
+                    if foreign_key.foreign_key_id == plan.foreign_key_id
                 )
-                # Strict inequalities keep the two propensity terms aligned:
-                # engaged > dormant in both frequency and recency, so the
-                # within-task label probability is strictly ordered.
-                engaged = (freq_norm > 0.5) & (silence < 0.5)
-                dormant = (freq_norm < 0.5) & (silence > 0.5)
-                engaged_positive += int(np.sum(labels[engaged] == 1))
-                engaged_total += int(np.sum(engaged))
-                dormant_positive += int(np.sum(labels[dormant] == 1))
-                dormant_total += int(np.sum(dormant))
-                tasks += 1
-                if tasks >= 24:
-                    break
-            if tasks >= 24:
-                break
-        self.assertGreaterEqual(tasks, 24, "need enough soft-label tasks")
-        self.assertGreater(engaged_total, 0, "need engaged entities")
-        self.assertGreater(dormant_total, 0, "need dormant entities")
-        engaged_rate = engaged_positive / engaged_total
-        dormant_rate = dormant_positive / dormant_total
-        self.assertGreater(
-            engaged_rate,
-            dormant_rate,
-            f"engaged {engaged_rate:.3f} should exceed dormant {dormant_rate:.3f}",
-        )
-
-    def test_history_gated_soft_positive_rate_is_soft(self) -> None:
-        """The requested rate is a soft base-rate constraint, not a hard match."""
-        observed = 0
-        soft = False
-        for index in range(20):
-            sample_id = f"hg_soft_rate_{index}"
-            runtime, schema, database = self._database(
-                sample_id, min_tables=5, max_tables=7
-            )
-            candidates = future_event_candidates(schema)
-            if not candidates:
-                continue
-            for seed in range(40):
-                task = build_history_gated_future_inactive_task(
-                    task_id=f"hg_soft_rate_{index}_{seed}",
-                    sample_id=sample_id,
-                    schema=schema,
-                    database=database,
-                    candidate=candidates[0],
-                    seed=runtime.seed("hg-soft-rate", seed),
-                    support_fraction=0.7,
-                    min_support_rows=4,
-                    min_query_rows=2,
-                    min_class_count_per_split=1,
-                    cutoff_quantile_min=0.45,
-                    cutoff_quantile_max=0.7,
-                    horizon_fraction_min=0.12,
-                    horizon_fraction_max=0.3,
-                    positive_rate_min=0.2,
-                    positive_rate_max=0.8,
+                event = database.table(plan.source_table_id)
+                times = event.column(plan.time_column_id or "")
+                assignments = event.column(fk.child_column_id)
+                history = np.zeros(len(labels), dtype=bool)
+                future = np.zeros(len(labels), dtype=bool)
+                valid = assignments >= 0
+                history[np.unique(assignments[valid & (times <= plan.cutoff_time)])] = True
+                future[
+                    np.unique(assignments[
+                        valid
+                        & (times > plan.cutoff_time)
+                        & (times <= plan.horizon_end_time)
+                    ])
+                ] = True
+                expected = np.full(len(labels), -1, dtype=np.int8)
+                if mechanism is TaskMechanism.HISTORY_GATED_FUTURE_ACTIVE:
+                    expected[history] = future[history].astype(np.int8)
+                else:
+                    expected[history] = (~future[history]).astype(np.int8)
+                np.testing.assert_array_equal(labels, expected)
+                self.assertAlmostEqual(
+                    plan.realized_positive_rate,
+                    float(np.mean(expected[expected >= 0])),
                 )
-                if task is None:
-                    continue
-                plan = task.plan
-                self.assertGreater(plan.realized_positive_rate, 0.0)
-                self.assertLess(plan.realized_positive_rate, 1.0)
-                observed += 1
-                if plan.realized_positive_rate != plan.requested_positive_rate:
-                    soft = True
-                if observed >= 40:
-                    break
-            if observed >= 40:
-                break
-        self.assertGreaterEqual(observed, 40, "need enough soft-label tasks")
-        self.assertTrue(
-            soft, "realized rate must deviate from the requested base rate"
-        )
+                checked += 1
+        self.assertGreaterEqual(checked, 2, "need active and inactive future-window tasks")
 
     def test_history_gated_labels_reproducible_from_plan(self) -> None:
-        """Serializing a plan must not shift the replayed label stream."""
+        """Serializing a plan must preserve the future-window labels."""
         for mechanism, build in (
             (
                 TaskMechanism.HISTORY_GATED_FUTURE_INACTIVE,
@@ -1089,7 +1036,7 @@ class TaskGenerationTests(unittest.TestCase):
         self.assertGreaterEqual(checked, 8, "need enough interaction tasks")
 
     def test_interaction_response_soft_positive_rate(self) -> None:
-        """The requested rate is a soft constraint, not a hard match."""
+        """The requested rate is soft, but labels must remain non-saturated."""
         observed = 0
         soft = False
         for index in range(16):
@@ -1128,8 +1075,16 @@ class TaskGenerationTests(unittest.TestCase):
                 if task is None:
                     continue
                 plan = task.plan
-                self.assertGreater(plan.realized_positive_rate, 0.0)
-                self.assertLess(plan.realized_positive_rate, 1.0)
+                self.assertGreater(
+                    plan.realized_positive_rate,
+                    0.05,
+                    "interaction labels must not saturate at all-zero",
+                )
+                self.assertLess(
+                    plan.realized_positive_rate,
+                    0.95,
+                    "interaction labels must not saturate at all-one",
+                )
                 observed += 1
                 if plan.realized_positive_rate != plan.requested_positive_rate:
                     soft = True

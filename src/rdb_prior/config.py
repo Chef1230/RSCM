@@ -35,7 +35,7 @@ from rdb_prior.routing.config import (
 from rdb_prior.schema.graph import SchemaGraphConfig
 from rdb_prior.schema.sampler import BlueprintSampler, BlueprintSamplerConfig
 from rdb_prior.schema.spec import TableRole
-from rdb_prior.task.model import TaskMechanism
+from rdb_prior.task.model import CompositeFamily, TaskMechanism
 from rdb_prior.task.pipeline import TaskPipelineConfig
 from rdb_prior.task.planner import TaskPlannerConfig
 
@@ -643,6 +643,10 @@ _TASK_OPTIONS = {
     "interaction_item_weight_min",
     "interaction_item_weight_max",
     "interaction_invert_probability",
+    "composite_family_weights",
+    "composite_max_path_depth",
+    "composite_max_predicates",
+    "composite_candidate_limit",
     "max_attempts_per_database",
     "require_full_task_count",
 }
@@ -896,6 +900,23 @@ def load_task_pipeline_config(
                 f"Invalid config.task.mechanism_weights: {error}"
             ) from error
 
+    raw_composite_weights = task.get("composite_family_weights")
+    if raw_composite_weights is None:
+        composite_family_weights = defaults.composite_family_weights
+    else:
+        composite_weights = _mapping(
+            raw_composite_weights, "config.task.composite_family_weights"
+        )
+        try:
+            composite_family_weights = tuple(
+                (CompositeFamily(name), float(weight))
+                for name, weight in sorted(composite_weights.items())
+            )
+        except (TypeError, ValueError) as error:
+            raise SchemaConfigError(
+                f"Invalid config.task.composite_family_weights: {error}"
+            ) from error
+
     instance_output = _stage_output_path(paths, "instance")
     manifest_value = _stage_manifest_path(
         paths,
@@ -908,7 +929,12 @@ def load_task_pipeline_config(
         planner_values = {
             name: task.get(name, getattr(defaults, name))
             for name in defaults.__dataclass_fields__
-            if name not in {"mechanism_weights", "tasks_per_database"}
+            if name
+            not in {
+                "mechanism_weights",
+                "composite_family_weights",
+                "tasks_per_database",
+            }
         }
         planner = TaskPlannerConfig(
             **planner_values,
@@ -917,6 +943,7 @@ def load_task_pipeline_config(
                 task.get("tasks_per_database", defaults.tasks_per_database),
             ),
             mechanism_weights=mechanism_weights,
+            composite_family_weights=composite_family_weights,
         )
         return TaskPipelineConfig(
             instance_manifest=_resolve_output_root(

@@ -220,6 +220,11 @@ def export_rdbpfn_tasks(
                 "sample_id": task_artifact.sample_id,
                 "task_id": task_plan.task_id,
                 "mechanism": task_plan.mechanism.value,
+                "composite_family": (
+                    None
+                    if task_plan.composite_spec is None
+                    else task_plan.composite_spec.family.value
+                ),
                 "prediction_type": task_plan.prediction_type.value,
                 "task_artifact": str(task_path),
                 "instance_artifact": str(instance_path),

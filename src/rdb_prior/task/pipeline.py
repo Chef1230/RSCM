@@ -82,13 +82,18 @@ class TaskPipelineConfig:
             "planner": {
                 name: getattr(planner, name)
                 for name in planner.__dataclass_fields__
-                if name != "mechanism_weights"
+                if name
+                not in {"mechanism_weights", "composite_family_weights"}
             }
             | {
                 "mechanism_weights": [
                     [mechanism.value, weight]
                     for mechanism, weight in planner.mechanism_weights
-                ]
+                ],
+                "composite_family_weights": [
+                    [family.value, weight]
+                    for family, weight in planner.composite_family_weights
+                ],
             },
         }
 
@@ -339,6 +344,11 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
                 "instance_artifact": str(instance_path),
                 "schema_id": schema.schema_id,
                 "mechanism": task.plan.mechanism.value,
+                "composite_family": (
+                    None
+                    if task.plan.composite_spec is None
+                    else task.plan.composite_spec.family.value
+                ),
                 "prediction_type": task.plan.prediction_type.value,
                 "support_count": len(task.data.support_row_ids),
                 "query_count": len(task.data.query_row_ids),

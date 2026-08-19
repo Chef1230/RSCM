@@ -1,0 +1,56 @@
+# =============================================================================
+# 组合关系分类 (composite relational classification) smoke 配置。
+# =============================================================================
+# 本文件继承 configs/template.yaml (loader 会把本文件 deep-merge 到模板之上),
+# 只覆盖以下内容:
+#   - output_root
+#   - schema 生成数量
+#   - task 采样参数 (composite 占 mechanism_weights 0.20, 6 类 family 权重)
+#   - task_generation 运行参数 (database_count / num_workers / overwrite)
+#
+# 运行:
+#   python -m rdb_prior.task.pipeline --config configs/smoke_composite.yaml
+# =============================================================================
+
+config_version: 1
+seed: 42
+
+paths:
+  output_root: outputs/smoke_composite
+
+generation:
+  num_schemas: 100
+
+task:
+  tasks_per_database: 2
+  # composite 机制权重 0.20; 其余机制保持模板权重, 相对分布不变。
+  mechanism_weights:
+    relation_attribute: 0.35
+    entity_future_event_existence: 0.25
+    history_gated_future_inactive: 0.08
+    history_gated_future_active: 0.07
+    future_event_attribute_condition: 0.20
+    temporal_relational_aggregate: 0.20
+    interaction_response: 0.15
+    relational_classification: 0.20
+  composite_family_weights:
+    filtered_aggregate: 0.25
+    count_distinct: 0.15
+    quantified_event: 0.15
+    multi_source: 0.15
+    multi_hop_filtered: 0.15
+    history_conditioned_future: 0.15
+  composite_max_path_depth: 3
+  composite_max_predicates: 2
+  composite_candidate_limit: 256
+  # 组合任务支持集更小, 放宽最小行数约束以便 smoke 快速凑齐任务数。
+  min_support_rows: 8
+  min_query_rows: 4
+  min_class_count_per_split: 1
+  max_attempts_per_database: 512
+
+task_generation:
+  database_count: 100
+  num_workers: 4
+  overwrite: false   # 安全值: 已存在产物时不覆盖
+  project_version: task-pipeline-composite-smoke-v1

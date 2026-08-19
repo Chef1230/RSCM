@@ -65,6 +65,52 @@ TEST_BASH = _find_working_bash()
 
 
 class H5ExportTests(unittest.TestCase):
+    def test_task_rows_are_shuffled_deterministically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            processed = root / "rdbpfn-processed"
+            dataset_names = (
+                "classification-a",
+                "classification-b",
+                "classification-c",
+            )
+            for name in dataset_names:
+                self._write_dataset(processed / name, task_type="classification")
+
+            def export(seed: int, filename: str) -> tuple[list[str], list[str]]:
+                progress: list[str] = []
+                output = root / filename
+                export_processed_dbb_to_h5(
+                    H5ExportConfig(
+                        processed_root=processed,
+                        output_path=output,
+                        total_rows=12,
+                        max_columns=4,
+                        seed=seed,
+                        dataset_names=dataset_names,
+                    ),
+                    progress=lambda _completed, _total, name: progress.append(name),
+                )
+                with h5py.File(output, "r") as handle:
+                    attrs = [
+                        str(handle.attrs["task_order"]),
+                        str(int(handle.attrs["task_order_seed"])),
+                    ]
+                return progress, attrs
+
+            first, first_attrs = export(0, "prior-0-a.h5")
+            repeat, repeat_attrs = export(0, "prior-0-b.h5")
+            changed, changed_attrs = export(1, "prior-1.h5")
+
+            self.assertEqual(
+                ["h5:classification-c", "h5:classification-a", "h5:classification-b"],
+                first,
+            )
+            self.assertEqual(first, repeat)
+            self.assertNotEqual(first, changed)
+            self.assertEqual(["seeded_permutation", "0"], first_attrs)
+            self.assertEqual(first_attrs, repeat_attrs)
+            self.assertEqual(["seeded_permutation", "1"], changed_attrs)
     def test_streams_processed_classification_tasks_in_training_format(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

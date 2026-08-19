@@ -253,6 +253,15 @@ def export_processed_dbb_to_h5(
         raise RuntimeError(
             f"no DBB tasks found under processed root {config.processed_root}"
         )
+    # DBB directories and their task lists are discovered in deterministic
+    # path order. The training loader streams H5 rows sequentially, so
+    # writing that order directly creates long, correlated runs of schemas
+    # and mechanisms. Shuffle the descriptor order once, deterministically,
+    # with the export seed; task contents remain deterministic because each
+    # task sample has its own derived RNG.
+    descriptor_order = np.random.default_rng(config.seed).permutation(
+        len(descriptors)
+    )
 
     output_path = config.output_path.resolve()
     if output_path.exists() and not config.overwrite:
@@ -283,7 +292,12 @@ def export_processed_dbb_to_h5(
             )
             handle.attrs["format"] = "rdbpfn-task-prior-v1"
             handle.attrs["source"] = str(config.processed_root.resolve())
-            for completed, descriptor in enumerate(descriptors, start=1):
+            handle.attrs["task_order"] = "seeded_permutation"
+            handle.attrs["task_order_seed"] = config.seed
+            for completed, descriptor_index in enumerate(
+                descriptor_order, start=1
+            ):
+                descriptor = descriptors[int(descriptor_index)]
                 dataset_path, dataset_name, task_metadata = descriptor
                 task_name = str(task_metadata.get("name", "unknown"))
                 try:

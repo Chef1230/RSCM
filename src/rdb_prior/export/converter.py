@@ -149,6 +149,32 @@ class RDBPFNConverter:
         }
         if plan.prediction_type is PredictionType.CLASSIFICATION:
             task_metadata["num_classes"] = int(len(np.unique(labels)))
+        if plan.composite_spec is not None:
+            composite = plan.composite_spec
+            task_metadata["mechanism"] = plan.mechanism.value
+            task_metadata["composite_family"] = composite.family.value
+            task_metadata["composite_aggregate_operators"] = [
+                aggregate.operator.value
+                for aggregate in composite.label_aggregates
+            ]
+            task_metadata["composite_path_count"] = len(
+                composite.label_aggregates
+            )
+            task_metadata["composite_max_path_depth"] = max(
+                len(aggregate.required_path)
+                for aggregate in composite.label_aggregates
+            )
+            task_metadata["composite_predicate_count"] = sum(
+                len(aggregate.predicates)
+                for aggregate in composite.label_aggregates
+            )
+            task_metadata["composite_has_eligibility"] = (
+                composite.eligibility_aggregate is not None
+            )
+            task_metadata["requested_positive_rate"] = (
+                plan.requested_positive_rate
+            )
+            task_metadata["realized_positive_rate"] = plan.realized_positive_rate
 
         metadata = {
             "dataset_name": plan.task_id,

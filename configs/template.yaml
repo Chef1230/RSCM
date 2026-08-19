@@ -411,7 +411,9 @@ task:
   # <== 分布参数: interaction_response 机制的 β 权重采样区间。
   #    z = logit(base_rate) + β_u·U_e + β_f·F_e − β_s·S_e + β_p·P_e;
   #    U_e = entity 父表可用特征 (min-max 归一化), F_e/P_e = log1p(历史曝光次数),
-  #    S_e = 距上次曝光的归一化沉默; base_rate 由 positive_rate 区间采样。
+  # Interaction-response beta ranges. Counts are log1p-transformed and
+  # normalized by the task-level 95th percentile; centered feature effects
+  # pass through tanh before the base-rate logit to prevent saturation.
   interaction_u_weight_min: 0.25
   interaction_u_weight_max: 2.0
   interaction_frequency_weight_min: 0.5
@@ -421,6 +423,21 @@ task:
   interaction_item_weight_min: 0.5
   interaction_item_weight_max: 3.0
   interaction_invert_probability: 0.35  # 整任务反转标签: invert=1 时正例表示 ignore
+
+  # <== 分布参数: 组合关系分类 (relational_classification) 机制。
+  #    顶层 mechanism_weights 中声明 relational_classification 才会启用;
+  #    启用后按 composite_family_weights 加权选择 family (六类组合任务)。
+  #    组合标签由可序列化 CompositeTaskSpec 精确重算, 与支持集/查询集标签一致。
+  composite_family_weights:
+    filtered_aggregate: 0.25
+    count_distinct: 0.15
+    quantified_event: 0.15
+    multi_source: 0.15
+    multi_hop_filtered: 0.15
+    history_conditioned_future: 0.15
+  composite_max_path_depth: 3       # 组合路径骨架最大深度
+  composite_max_predicates: 2       # 每个聚合窗口内 predicate 数量上限
+  composite_candidate_limit: 256    # 每个数据库、每个 family 的候选上限
 
   max_attempts_per_database: 128
   require_full_task_count: true  # 凑不齐 tasks_per_database 时报错
