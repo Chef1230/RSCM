@@ -61,7 +61,7 @@ class SchemaPipelineTests(unittest.TestCase):
                     artifact_path.read_text(encoding="utf-8")
                 )
                 self.assertEqual("physical_schema", payload["artifact_type"])
-                self.assertEqual(2, payload["artifact_version"])
+                self.assertEqual(3, payload["artifact_version"])
                 self.assertTrue(payload["validation"]["is_valid"])
                 self.assertNotIn("motifs", payload["blueprint"])
                 self.assertIn(

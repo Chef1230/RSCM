@@ -20,7 +20,10 @@ from rdb_prior.compilation.model import (
 from rdb_prior.runtime import RuntimeRecord
 from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.instance.plan import InstancePlan
+from rdb_prior.priors.model import DatabasePriorPlan
 from rdb_prior.schema.blueprint import SchemaBlueprint
+from rdb_prior.schema.semantics import SemanticSchemaPlan
+from rdb_prior.task.program import TaskProgramPlan
 from rdb_prior.schema.validation import ValidationReport
 from rdb_prior.schema.validation import (
     ValidationIssue,
@@ -86,6 +89,9 @@ class SchemaArtifactWriter:
         blueprint: SchemaBlueprint,
         compilation: CompilationResult,
         report: ValidationReport,
+        semantic_schema: SemanticSchemaPlan | None = None,
+        process_plan: tuple[Mapping[str, Any], ...] = (),
+        prior_compatibility: Mapping[str, Any] | None = None,
     ) -> Path:
         if not isinstance(sample_id, str) or not _ARTIFACT_ID.fullmatch(
             sample_id
@@ -105,13 +111,20 @@ class SchemaArtifactWriter:
         output_path = self.schema_directory / f"{sample_id}.json"
         payload = {
             "artifact_type": "physical_schema",
-            "artifact_version": 2,
+            "artifact_version": 3,
             "sample_id": sample_id,
             "runtime": runtime.to_dict(),
             "blueprint": blueprint_to_dict(blueprint),
             "physical_schema": compilation.schema.to_dict(),
             "compilation_trace": compilation.trace.to_dict(),
             "validation": validation_report_to_dict(report),
+            "semantic_schema": (
+                None if semantic_schema is None else semantic_schema.to_dict()
+            ),
+            "process_plan": [dict(item) for item in process_plan],
+            "prior_compatibility": (
+                {} if prior_compatibility is None else dict(prior_compatibility)
+            ),
         }
         self._write_json(output_path, payload)
         return output_path
@@ -165,6 +178,9 @@ class SchemaArtifact:
     blueprint: SchemaBlueprint
     compilation: CompilationResult
     validation: ValidationReport
+    semantic_schema: SemanticSchemaPlan | None = None
+    process_plan: tuple[Mapping[str, Any], ...] = ()
+    prior_compatibility: Mapping[str, Any] | None = None
 
 
 def load_schema_artifact(path: str | Path) -> SchemaArtifact:
@@ -174,7 +190,7 @@ def load_schema_artifact(path: str | Path) -> SchemaArtifact:
         raise ValueError("schema artifact root must be an object")
     if payload.get("artifact_type") != "physical_schema":
         raise ValueError("unsupported schema artifact type")
-    if payload.get("artifact_version") != 2:
+    if payload.get("artifact_version") not in {2, 3}:
         raise ValueError("unsupported schema artifact version")
 
     blueprint = SchemaBlueprint.from_dict(payload["blueprint"])
@@ -187,11 +203,20 @@ def load_schema_artifact(path: str | Path) -> SchemaArtifact:
         blueprint=blueprint,
         compilation=CompilationResult(schema=schema, trace=trace),
         validation=validation,
+        semantic_schema=(
+            None
+            if payload.get("semantic_schema") is None
+            else SemanticSchemaPlan.from_dict(payload["semantic_schema"])
+        ),
+        process_plan=tuple(payload.get("process_plan", ())),
+        prior_compatibility=payload.get("prior_compatibility"),
     )
     if artifact.compilation.schema.blueprint_id != blueprint.blueprint_id:
         raise ValueError("artifact blueprint and physical schema do not match")
     if validation.blueprint_id != blueprint.blueprint_id:
         raise ValueError("artifact blueprint and validation do not match")
+    if artifact.semantic_schema is not None and artifact.semantic_schema.schema_id != schema.schema_id:
+        raise ValueError("artifact semantic schema and physical schema do not match")
     return artifact
 
 
@@ -214,6 +239,8 @@ class InstanceArtifactWriter:
         plan: InstancePlan,
         database: DatabaseInstance,
         report: InstanceValidationReport,
+        prior_plan: DatabasePriorPlan | None = None,
+        task_programs: tuple[TaskProgramPlan, ...] = (),
     ) -> Path:
         if not _ARTIFACT_ID.fullmatch(sample_id):
             raise ValueError("sample_id is not artifact-safe")
@@ -234,6 +261,13 @@ class InstanceArtifactWriter:
         temporary.mkdir()
         try:
             _write_json_file(temporary / "instance_plan.json", plan.to_dict())
+            if prior_plan is not None:
+                _write_json_file(temporary / "database_prior_plan.json", prior_plan.to_dict())
+            if task_programs:
+                _write_json_file(
+                    temporary / "task_programs.json",
+                    {"programs": [item.to_dict() for item in task_programs]},
+                )
             _write_json_file(temporary / "runtime.json", runtime.to_dict())
             _write_json_file(temporary / "validation.json", report.to_dict())
             table_entries: list[dict[str, Any]] = []
@@ -258,7 +292,7 @@ class InstanceArtifactWriter:
                 temporary / "artifact.json",
                 {
                     "artifact_type": "database_instance",
-                    "artifact_version": 1,
+                    "artifact_version": 2,
                     "sample_id": sample_id,
                     "instance_id": database.instance_id,
                     "schema_id": schema.schema_id,
@@ -267,6 +301,12 @@ class InstanceArtifactWriter:
                     "plan": "instance_plan.json",
                     "runtime": "runtime.json",
                     "validation": "validation.json",
+                    "database_prior_plan": (
+                        None if prior_plan is None else "database_prior_plan.json"
+                    ),
+                    "task_programs": (
+                        None if not task_programs else "task_programs.json"
+                    ),
                     "tables": table_entries,
                 },
             )
@@ -313,6 +353,8 @@ class InstanceArtifact:
     plan: InstancePlan
     database: DatabaseInstance
     validation: InstanceValidationReport
+    prior_plan: DatabasePriorPlan | None = None
+    task_programs: tuple[TaskProgramPlan, ...] = ()
 
 
 def load_instance_artifact(path: str | Path) -> InstanceArtifact:
@@ -320,7 +362,7 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if payload.get("artifact_type") != "database_instance":
         raise ValueError("unsupported instance artifact type")
-    if payload.get("artifact_version") != 1:
+    if payload.get("artifact_version") not in {1, 2}:
         raise ValueError("unsupported instance artifact version")
     root = manifest_path.parent
     plan = InstancePlan.from_dict(
@@ -343,6 +385,17 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
         plan_id=payload["plan_id"],
         tables=tuple(tables),
     )
+    prior_file = payload.get("database_prior_plan")
+    prior_plan = (
+        None
+        if prior_file is None
+        else DatabasePriorPlan.from_dict(json.loads((root / prior_file).read_text(encoding="utf-8")))
+    )
+    programs_file = payload.get("task_programs")
+    task_programs = ()
+    if programs_file is not None:
+        program_payload = json.loads((root / programs_file).read_text(encoding="utf-8"))
+        task_programs = tuple(TaskProgramPlan.from_dict(item) for item in program_payload.get("programs", ()))
     return InstanceArtifact(
         sample_id=payload["sample_id"],
         schema_artifact=payload["schema_artifact"],
@@ -350,6 +403,8 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
         plan=plan,
         database=database,
         validation=validation,
+        prior_plan=prior_plan,
+        task_programs=task_programs,
     )
 
 

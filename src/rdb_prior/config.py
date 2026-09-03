@@ -27,6 +27,8 @@ from rdb_prior.instance.plan import (
 )
 from rdb_prior.instance.planner import InstancePlannerConfig, RoleSCMPrior
 from rdb_prior.pipeline import InstancePipelineConfig, SchemaPipelineConfig
+from rdb_prior.priors.model import PriorFamily, TaskPolicyPlan
+from rdb_prior.priors.planner import PriorPlannerConfig
 from rdb_prior.routing.config import (
     RoutedH5Config,
     RouterModelConfig,
@@ -190,6 +192,7 @@ def load_schema_pipeline_config(
             "rdbpfn_export",
             "path_router",
             "routed_h5",
+            "prior",
         },
         "config",
     )
@@ -269,6 +272,7 @@ def load_schema_pipeline_config(
     _section(root, "rdbpfn_export", _RDBPFN_EXPORT_OPTIONS)
     _section(root, "path_router", _PATH_ROUTER_OPTIONS)
     _section(root, "routed_h5", _ROUTED_H5_OPTIONS)
+    _section(root, "prior", _PRIOR_OPTIONS)
 
     cli = overrides or SchemaConfigOverrides()
     if not isinstance(cli, SchemaConfigOverrides):
@@ -610,6 +614,32 @@ _INSTANCE_GENERATION_OPTIONS = {
     "project_version",
 }
 
+_PRIOR_OPTIONS = {
+    "database_family_weights",
+    "motif_family_weights",
+    "families",
+    "relational_scm",
+    "relational_tree",
+    "temporal_event",
+    "rule_process",
+    "task_policy",
+    "state_dimension",
+}
+
+_PRIOR_TASK_POLICY_OPTIONS = {
+    "programs_per_database",
+    "require_family_compatibility",
+    "sample_program_before_data",
+    "posthoc_horizon_selection",
+    "max_materialization_attempts",
+    "cutoff_fraction_min",
+    "cutoff_fraction_max",
+    "horizon_fraction_min",
+    "horizon_fraction_max",
+    "positive_rate_min",
+    "positive_rate_max",
+}
+
 _TASK_OPTIONS = {
     "tasks_per_database",
     "mechanism_weights",
@@ -758,6 +788,7 @@ def load_instance_pipeline_config(
         "instance_generation",
         _INSTANCE_GENERATION_OPTIONS,
     )
+    prior_section = _section(root, "prior", _PRIOR_OPTIONS)
     cli = overrides or InstanceConfigOverrides()
     if not isinstance(cli, InstanceConfigOverrides):
         raise TypeError("overrides must be InstanceConfigOverrides or None")
@@ -816,6 +847,7 @@ def load_instance_pipeline_config(
             role_scm=role_scm,
             event_temporal_mechanism_weights=mechanism_weights,
         )
+        prior_config = _prior_planner_config(prior_section)
         return InstancePipelineConfig(
             schema_manifest=_resolve_output_root(
                 config_path=config_path,
@@ -853,6 +885,7 @@ def load_instance_pipeline_config(
                 "project_version", "instance-pipeline-v1"
             ),
             planner=planner,
+            prior=prior_config,
         )
     except (TypeError, ValueError) as error:
         raise SchemaConfigError(
@@ -1339,6 +1372,36 @@ def _role_scm_mapping(
             raise SchemaConfigError(f"Invalid {path}: {error}") from error
         result.append((role, prior))
     return tuple(result)
+
+
+def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
+    """Parse the optional P0/P1 prior section without changing old configs."""
+    if not raw:
+        return None
+    weights_raw = raw.get("database_family_weights")
+    if weights_raw is None:
+        return None
+    weights = _weight_mapping(
+        weights_raw,
+        (),
+        PriorFamily,
+        "config.prior.database_family_weights",
+        sort_keys=True,
+    )
+    policy_raw = _mapping(raw.get("task_policy", {}), "config.prior.task_policy")
+    _reject_unknown(policy_raw, _PRIOR_TASK_POLICY_OPTIONS, "config.prior.task_policy")
+    defaults = TaskPolicyPlan()
+    policy = TaskPolicyPlan(
+        **{
+            name: policy_raw.get(name, getattr(defaults, name))
+            for name in defaults.__dataclass_fields__
+        }
+    )
+    return PriorPlannerConfig(
+        database_family_weights=weights,
+        task_policy=policy,
+        state_dimension=raw.get("state_dimension", 4),
+    )
 
 
 # Project-wide default template. Every loaded config is deep-merged on top

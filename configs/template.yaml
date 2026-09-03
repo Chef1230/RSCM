@@ -539,3 +539,24 @@ routed_h5:
   start_index: 0
   device: auto
   overwrite: false
+
+# -----------------------------------------------------------------------------
+# Unified database prior (P0/P1).  Omit this section to reproduce legacy runs.
+# -----------------------------------------------------------------------------
+prior:
+  database_family_weights:
+    legacy_role_scm: 0.75
+    temporal_event: 0.25
+  state_dimension: 4
+  task_policy:
+    programs_per_database: 2
+    require_family_compatibility: true
+    sample_program_before_data: true
+    posthoc_horizon_selection: false
+    max_materialization_attempts: 8
+    cutoff_fraction_min: 0.45
+    cutoff_fraction_max: 0.70
+    horizon_fraction_min: 0.12
+    horizon_fraction_max: 0.30
+    positive_rate_min: 0.05
+    positive_rate_max: 0.95

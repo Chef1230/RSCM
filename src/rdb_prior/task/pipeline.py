@@ -13,6 +13,7 @@ from rdb_prior.artifacts import load_instance_artifact, load_schema_artifact
 from rdb_prior.runtime import digest_config
 from rdb_prior.task.artifacts import TaskArtifactWriter
 from rdb_prior.task.planner import TaskPlanner, TaskPlannerConfig
+from rdb_prior.task.program import TaskExecutor
 from rdb_prior.task.validation import validate_task
 from rdb_prior.validation.checks import validate_database_instance
 
@@ -141,7 +142,7 @@ def generate_tasks(
     manifest = json.loads(config.instance_manifest.read_text(encoding="utf-8"))
     if manifest.get("artifact_type") != "database_instance_manifest":
         raise ValueError("input is not a database instance manifest")
-    if manifest.get("artifact_version") != 1:
+    if manifest.get("artifact_version") not in {1, 2}:
         raise ValueError("unsupported database instance manifest version")
     entries = manifest.get("entries")
     if not isinstance(entries, list):
@@ -294,13 +295,32 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
             f"{issues}"
         )
     runtime = instance_artifact.runtime.restore_context().child("task")
-    tasks = TaskPlanner(item.planner_config).generate(
-        sample_id=instance_artifact.sample_id,
-        schema=schema,
-        database=database,
-        runtime=runtime,
-        instance_plan=instance_artifact.plan,
-    )
+    programs_by_task_id = {}
+    if instance_artifact.task_programs:
+        executor = TaskExecutor()
+        generated = []
+        for program in instance_artifact.task_programs:
+            task = executor.execute(
+                sample_id=instance_artifact.sample_id,
+                schema=schema,
+                database=database,
+                program=program,
+            )
+            if task is None:
+                raise ValueError(
+                    f"pre-sampled task program {program.program_id} is invalid"
+                )
+            generated.append(task)
+            programs_by_task_id[task.plan.task_id] = program
+        tasks = tuple(generated)
+    else:
+        tasks = TaskPlanner(item.planner_config).generate(
+            sample_id=instance_artifact.sample_id,
+            schema=schema,
+            database=database,
+            runtime=runtime,
+            instance_plan=instance_artifact.plan,
+        )
     writer = TaskArtifactWriter(
         output_root=item.output_root,
         overwrite=item.overwrite,
@@ -332,6 +352,7 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
             runtime=runtime_record,
             task=task,
             report=report,
+            task_program=programs_by_task_id.get(task.plan.task_id),
         )
         artifact_paths.append(artifact_path)
         output_entries.append(

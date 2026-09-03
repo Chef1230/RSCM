@@ -20,6 +20,9 @@ from rdb_prior.instance.scm_prior import (
     sample_scm_meta_parameters,
     sample_table_scm_parameters,
 )
+from rdb_prior.priors.families.legacy_role_scm import bind_legacy_plan
+from rdb_prior.priors.families.temporal_event import bind_temporal_event_plan
+from rdb_prior.priors.model import DatabasePriorPlan, PriorFamily
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.spec import Optionality, TableRole
 
@@ -441,6 +444,7 @@ class InstancePlanner:
         sample_id: str,
         schema: PhysicalSchema,
         runtime: RuntimeContext,
+        prior_plan: DatabasePriorPlan | None = None,
     ) -> InstancePlan:
         if not isinstance(schema, PhysicalSchema):
             raise TypeError("schema must be PhysicalSchema")
@@ -616,7 +620,7 @@ class InstancePlanner:
             )
 
         relations = self._relation_plans(schema, runtime)
-        return InstancePlan(
+        plan = InstancePlan(
             plan_id=f"instance_plan_{sample_id}",
             sample_id=sample_id,
             schema_id=schema.schema_id,
@@ -629,6 +633,13 @@ class InstancePlanner:
             calendar_start_seconds=calendar_start,
             calendar_end_seconds=calendar_end,
         )
+        if prior_plan is None:
+            return plan
+        if prior_plan.semantic_schema.schema_id != schema.schema_id:
+            raise ValueError("prior plan does not belong to physical schema")
+        if prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+            return bind_temporal_event_plan(schema, plan, prior_plan)
+        return bind_legacy_plan(plan, prior_plan)
 
     def _event_mechanism(
         self,

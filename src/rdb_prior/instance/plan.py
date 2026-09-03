@@ -7,6 +7,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from rdb_prior.priors.model import MotifMechanismBundle
 from rdb_prior.schema.spec import TableRole
 
 
@@ -54,6 +55,76 @@ class EventTemporalMechanism(str, Enum):
     BURST = "burst"
     CHURN = "churn"
     SEASONAL = "seasonal"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ColumnMechanismPlan:
+    column_id: str
+    family: str
+    parent_column_ids: tuple[str, ...] = ()
+    shared_state_ids: tuple[str, ...] = ()
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("column_id", self.column_id)
+        _identifier("family", self.family)
+        _optional_identifier_tuple("parent_column_ids", self.parent_column_ids)
+        _optional_identifier_tuple("shared_state_ids", self.shared_state_ids)
+        object.__setattr__(self, "parameters", _json_parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"column_id": self.column_id, "family": self.family, "parent_column_ids": list(self.parent_column_ids), "shared_state_ids": list(self.shared_state_ids), "parameters": dict(self.parameters)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ColumnMechanismPlan":
+        return cls(column_id=data["column_id"], family=data["family"], parent_column_ids=tuple(data.get("parent_column_ids", ())), shared_state_ids=tuple(data.get("shared_state_ids", ())), parameters=tuple(data.get("parameters", {}).items()))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PopulationMechanismPlan:
+    table_id: str
+    family: str
+    parent_table_id: str | None = None
+    state_ids: tuple[str, ...] = ()
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("table_id", self.table_id)
+        _identifier("family", self.family)
+        if self.parent_table_id is not None:
+            _identifier("parent_table_id", self.parent_table_id)
+        _optional_identifier_tuple("state_ids", self.state_ids)
+        object.__setattr__(self, "parameters", _json_parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"table_id": self.table_id, "family": self.family, "parent_table_id": self.parent_table_id, "state_ids": list(self.state_ids), "parameters": dict(self.parameters)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PopulationMechanismPlan":
+        return cls(table_id=data["table_id"], family=data["family"], parent_table_id=data.get("parent_table_id"), state_ids=tuple(data.get("state_ids", ())), parameters=tuple(data.get("parameters", {}).items()))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TemporalProcessPlan:
+    table_id: str
+    family: str
+    state_ids: tuple[str, ...] = ()
+    covariate_column_ids: tuple[str, ...] = ()
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("table_id", self.table_id)
+        _identifier("family", self.family)
+        _optional_identifier_tuple("state_ids", self.state_ids)
+        _optional_identifier_tuple("covariate_column_ids", self.covariate_column_ids)
+        object.__setattr__(self, "parameters", _json_parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"table_id": self.table_id, "family": self.family, "state_ids": list(self.state_ids), "covariate_column_ids": list(self.covariate_column_ids), "parameters": dict(self.parameters)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TemporalProcessPlan":
+        return cls(table_id=data["table_id"], family=data["family"], state_ids=tuple(data.get("state_ids", ())), covariate_column_ids=tuple(data.get("covariate_column_ids", ())), parameters=tuple(data.get("parameters", {}).items()))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -168,6 +239,13 @@ class InstancePlan:
     parameters: tuple[tuple[str, float], ...] = ()
     calendar_start_seconds: int | None = None
     calendar_end_seconds: int | None = None
+    prior_plan_id: str | None = None
+    prior_family: str = "legacy_role_scm"
+    motif_bundles: tuple[MotifMechanismBundle, ...] = ()
+    shared_state_ids: tuple[str, ...] = ()
+    column_mechanisms: tuple[ColumnMechanismPlan, ...] = ()
+    population_mechanisms: tuple[PopulationMechanismPlan, ...] = ()
+    temporal_processes: tuple[TemporalProcessPlan, ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("plan_id", "sample_id", "schema_id", "blueprint_id"):
@@ -214,6 +292,22 @@ class InstancePlan:
             raise ValueError(
                 "calendar_end_seconds must be after calendar_start_seconds"
             )
+        if self.prior_plan_id is not None:
+            _identifier("prior_plan_id", self.prior_plan_id)
+        _identifier("prior_family", self.prior_family)
+        if not isinstance(self.motif_bundles, tuple) or not all(
+            isinstance(item, MotifMechanismBundle) for item in self.motif_bundles
+        ):
+            raise TypeError("motif_bundles must contain MotifMechanismBundle values")
+        _optional_identifier_tuple("shared_state_ids", self.shared_state_ids)
+        for name, item_type in (
+            ("column_mechanisms", ColumnMechanismPlan),
+            ("population_mechanisms", PopulationMechanismPlan),
+            ("temporal_processes", TemporalProcessPlan),
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, tuple) or not all(isinstance(item, item_type) for item in values):
+                raise TypeError(f"{name} must contain {item_type.__name__} values")
         object.__setattr__(self, "parameters", _parameters(self.parameters))
 
     def table(self, table_id: str) -> TableMechanismPlan:
@@ -268,6 +362,13 @@ class InstancePlan:
             "parameters": dict(self.parameters),
             "calendar_start_seconds": self.calendar_start_seconds,
             "calendar_end_seconds": self.calendar_end_seconds,
+            "prior_plan_id": self.prior_plan_id,
+            "prior_family": self.prior_family,
+            "motif_bundles": [item.to_dict() for item in self.motif_bundles],
+            "shared_state_ids": list(self.shared_state_ids),
+            "column_mechanisms": [item.to_dict() for item in self.column_mechanisms],
+            "population_mechanisms": [item.to_dict() for item in self.population_mechanisms],
+            "temporal_processes": [item.to_dict() for item in self.temporal_processes],
         }
 
     @classmethod
@@ -326,6 +427,13 @@ class InstancePlan:
             parameters=tuple(data.get("parameters", {}).items()),
             calendar_start_seconds=data.get("calendar_start_seconds"),
             calendar_end_seconds=data.get("calendar_end_seconds"),
+            prior_plan_id=data.get("prior_plan_id"),
+            prior_family=data.get("prior_family", "legacy_role_scm"),
+            motif_bundles=tuple(MotifMechanismBundle.from_dict(item) for item in data.get("motif_bundles", ())),
+            shared_state_ids=tuple(data.get("shared_state_ids", ())),
+            column_mechanisms=tuple(ColumnMechanismPlan.from_dict(item) for item in data.get("column_mechanisms", ())),
+            population_mechanisms=tuple(PopulationMechanismPlan.from_dict(item) for item in data.get("population_mechanisms", ())),
+            temporal_processes=tuple(TemporalProcessPlan.from_dict(item) for item in data.get("temporal_processes", ())),
         )
 
 
@@ -357,6 +465,36 @@ def _identifier_tuple(name: str, value: Any) -> None:
         raise ValueError(f"{name} must contain unique values")
 
 
+def _optional_identifier_tuple(name: str, value: Any) -> None:
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple")
+    for item in value:
+        _identifier(name, item)
+    if len(set(value)) != len(value):
+        raise ValueError(f"{name} must contain unique values")
+
+
+def _json_parameters(value: tuple[tuple[str, object], ...]) -> tuple[tuple[str, object], ...]:
+    import json
+
+    if not isinstance(value, tuple):
+        raise TypeError("parameters must be a tuple")
+    result: list[tuple[str, object]] = []
+    for item in value:
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError("parameters items must be pairs")
+        name, parameter = item
+        _identifier("parameter name", name)
+        try:
+            json.dumps(parameter, allow_nan=False)
+        except (TypeError, ValueError) as error:
+            raise TypeError("parameters must be JSON-safe") from error
+        result.append((name, parameter))
+    if len({name for name, _value in result}) != len(result):
+        raise ValueError("parameter names must be unique")
+    return tuple(sorted(result, key=lambda item: item[0]))
+
+
 def _parameters(
     value: tuple[tuple[str, float], ...],
 ) -> tuple[tuple[str, float], ...]:
@@ -380,6 +518,10 @@ __all__ = [
     "FeatureSCMFamily",
     "RootCauseFamily",
     "TemporalFamily",
+    "EventTemporalMechanism",
+    "ColumnMechanismPlan",
+    "PopulationMechanismPlan",
+    "TemporalProcessPlan",
     "PopulationPlan",
     "TableMechanismPlan",
     "RelationMechanismPlan",

@@ -13,6 +13,7 @@ import numpy as np
 
 from rdb_prior.runtime import RuntimeRecord
 from rdb_prior.task.model import PlannedTask, TaskData, TaskPlan
+from rdb_prior.task.program import TaskProgramPlan
 from rdb_prior.task.validation import TaskValidationReport
 
 
@@ -37,6 +38,7 @@ class TaskArtifactWriter:
         runtime: RuntimeRecord,
         task: PlannedTask,
         report: TaskValidationReport,
+        task_program: TaskProgramPlan | None = None,
     ) -> Path:
         for name, value in (
             ("sample_id", sample_id),
@@ -59,6 +61,8 @@ class TaskArtifactWriter:
         temporary.mkdir()
         try:
             _write_json(temporary / "task_plan.json", task.plan.to_dict())
+            if task_program is not None:
+                _write_json(temporary / "task_program.json", task_program.to_dict())
             _write_json(temporary / "runtime.json", runtime.to_dict())
             _write_json(temporary / "validation.json", report.to_dict())
             with (temporary / "task_data.npz").open("wb") as handle:
@@ -73,7 +77,7 @@ class TaskArtifactWriter:
                 temporary / "artifact.json",
                 {
                     "artifact_type": "relational_task",
-                    "artifact_version": 1,
+                    "artifact_version": 2,
                     "sample_id": sample_id,
                     "task_id": task.plan.task_id,
                     "instance_artifact": instance_artifact,
@@ -82,6 +86,9 @@ class TaskArtifactWriter:
                     "data": "task_data.npz",
                     "runtime": "runtime.json",
                     "validation": "validation.json",
+                    "task_program": (
+                        None if task_program is None else "task_program.json"
+                    ),
                 },
             )
             if target.exists():
@@ -131,6 +138,7 @@ class TaskArtifact:
     runtime: RuntimeRecord
     task: PlannedTask
     validation: TaskValidationReport
+    task_program: TaskProgramPlan | None = None
 
 
 def load_task_artifact(path: str | Path) -> TaskArtifact:
@@ -138,7 +146,7 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     if payload.get("artifact_type") != "relational_task":
         raise ValueError("unsupported task artifact type")
-    if payload.get("artifact_version") != 1:
+    if payload.get("artifact_version") not in {1, 2}:
         raise ValueError("unsupported task artifact version")
     root = artifact_path.parent
     plan = TaskPlan.from_dict(
@@ -157,6 +165,13 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
     validation = TaskValidationReport.from_dict(
         json.loads((root / payload["validation"]).read_text(encoding="utf-8"))
     )
+    task_program = (
+        None
+        if payload.get("task_program") is None
+        else TaskProgramPlan.from_dict(
+            json.loads((root / payload["task_program"]).read_text(encoding="utf-8"))
+        )
+    )
     if plan.task_id != payload["task_id"]:
         raise ValueError("task artifact plan identity mismatch")
     return TaskArtifact(
@@ -166,6 +181,7 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
         runtime=runtime,
         task=PlannedTask(plan=plan, data=data),
         validation=validation,
+        task_program=task_program,
     )
 
 

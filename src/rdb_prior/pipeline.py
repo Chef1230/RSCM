@@ -23,7 +23,11 @@ from rdb_prior.extensions.defaults import default_extension_bundle
 from rdb_prior.extensions.interfaces import ExtensionBundle
 from rdb_prior.generation.database import DatabaseGenerator
 from rdb_prior.instance.planner import InstancePlanner, InstancePlannerConfig
+from rdb_prior.priors.compatibility import entity_event_candidates
+from rdb_prior.priors.model import PriorFamily
+from rdb_prior.priors.planner import PriorPlanner, PriorPlannerConfig
 from rdb_prior.runtime import RuntimeContext, digest_config
+from rdb_prior.schema.domain_prototypes import sample_semantic_schema
 from rdb_prior.schema.graph import (
     SchemaGraphArtifactWriter,
     SchemaGraphConfig,
@@ -39,6 +43,7 @@ from rdb_prior.task.pipeline import (
     TaskPipelineResult,
     generate_tasks,
 )
+from rdb_prior.task.program import TaskExecutor, TaskProgramPlanner
 
 
 _SAMPLE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -197,6 +202,7 @@ class InstancePipelineConfig:
     progress_every: int = 100
     project_version: str = "instance-pipeline-v1"
     planner: InstancePlannerConfig = InstancePlannerConfig()
+    prior: PriorPlannerConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.schema_manifest, Path):
@@ -229,6 +235,8 @@ class InstancePipelineConfig:
             raise TypeError("overwrite must be a boolean")
         if not isinstance(self.planner, InstancePlannerConfig):
             raise TypeError("planner must be InstancePlannerConfig")
+        if self.prior is not None and not isinstance(self.prior, PriorPlannerConfig):
+            raise TypeError("prior must be PriorPlannerConfig or None")
 
     def to_dict(self) -> dict[str, object]:
         planner = self.planner
@@ -286,6 +294,18 @@ class InstancePipelineConfig:
                     }
                     for role, prior in planner.role_scm
                 },
+                "prior": (
+                    None
+                    if self.prior is None
+                    else {
+                        "database_family_weights": [
+                            [family.value, weight]
+                            for family, weight in self.prior.database_family_weights
+                        ],
+                        "task_policy": self.prior.task_policy.to_dict(),
+                        "state_dimension": self.prior.state_dimension,
+                    }
+                ),
             },
         }
 
@@ -307,6 +327,7 @@ class _InstanceWorkItem:
     schema_path: Path
     output_root: Path
     planner_config: InstancePlannerConfig
+    prior_config: PriorPlannerConfig | None
     overwrite: bool
     project_version: str
     config_digest: str
@@ -392,6 +413,10 @@ def generate_physical_schemas(
             runtime,
         )
         physical_schema = compilation.schema
+        semantic_schema = sample_semantic_schema(
+            physical_schema,
+            runtime.child("semantic-schema"),
+        )
         runtime_record = runtime.record(
             project_version=config.project_version,
             config_digest=config_digest,
@@ -406,6 +431,16 @@ def generate_physical_schemas(
             blueprint=blueprint,
             compilation=compilation,
             report=report,
+            semantic_schema=semantic_schema,
+            prior_compatibility={
+                "temporal_event_candidate_count": len(
+                    entity_event_candidates(blueprint, physical_schema)
+                ),
+                "implemented_families": [
+                    PriorFamily.LEGACY_ROLE_SCM.value,
+                    PriorFamily.TEMPORAL_EVENT.value,
+                ],
+            },
         )
         graph_artifacts = graph_writer.commit(
             sample_id=sample_id,
@@ -532,6 +567,7 @@ def generate_database_instances(
                 schema_path=schema_path,
                 output_root=config.output_root,
                 planner_config=config.planner,
+                prior_config=config.prior,
                 overwrite=config.overwrite,
                 project_version=config.project_version,
                 config_digest=config_digest,
@@ -623,24 +659,80 @@ def _generate_one_database_instance(
     artifact = load_schema_artifact(item.schema_path)
     runtime = artifact.runtime.restore_context().child("database-instance")
     schema = artifact.compilation.schema
-    plan = InstancePlanner(item.planner_config).plan(
-        sample_id=artifact.sample_id,
-        schema=schema,
-        runtime=runtime,
-    )
-    plan_report = validate_instance_plan(schema, plan)
-    if not plan_report.is_valid:
-        raise ValueError(
-            f"invalid instance plan for {artifact.sample_id}: "
-            f"{[issue.code for issue in plan_report.issues]}"
+    prior_plan = None
+    if item.prior_config is not None:
+        semantic_schema = artifact.semantic_schema or sample_semantic_schema(
+            schema,
+            runtime.child("semantic-schema"),
         )
-    database = DatabaseGenerator().generate(schema=schema, plan=plan)
-    report = validate_database_instance(schema, plan, database)
-    if not report.is_valid:
-        raise ValueError(
-            f"invalid database instance for {artifact.sample_id}: "
-            f"{[issue.code for issue in report.issues]}"
+        prior_plan = PriorPlanner(item.prior_config).plan(
+            blueprint=artifact.blueprint,
+            physical_schema=schema,
+            semantic_schema=semantic_schema,
+            runtime=runtime.child("prior"),
         )
+    attempts = 1
+    if prior_plan is not None and prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+        attempts = prior_plan.task_policy.max_materialization_attempts
+
+    last_error: ValueError | None = None
+    for attempt in range(attempts):
+        # The original seed path is intentionally preserved for legacy plans.
+        # Temporal retries get an explicitly derived, materialization-only seed.
+        attempt_runtime = runtime if attempt == 0 else runtime.child("materialization-retry", attempt)
+        try:
+            plan = InstancePlanner(item.planner_config).plan(
+                sample_id=artifact.sample_id,
+                schema=schema,
+                runtime=attempt_runtime,
+                prior_plan=prior_plan,
+            )
+            task_programs = ()
+            if prior_plan is not None and prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+                # Programs are sampled from the plan calendar before any rows are
+                # materialized.  They are never calibrated from realized labels.
+                task_programs = TaskProgramPlanner().plan(
+                    schema=schema,
+                    instance_plan=plan,
+                    prior_plan=prior_plan,
+                    runtime=attempt_runtime.child("task-program"),
+                )
+            plan_report = validate_instance_plan(schema, plan)
+            if not plan_report.is_valid:
+                raise ValueError(
+                    f"invalid instance plan: {[issue.code for issue in plan_report.issues]}"
+                )
+            materialization = DatabaseGenerator().materialize(schema=schema, plan=plan)
+            plan = materialization.plan
+            database = materialization.database
+            report = validate_database_instance(schema, plan, database)
+            if not report.is_valid:
+                raise ValueError(
+                    f"invalid database instance: {[issue.code for issue in report.issues]}"
+                )
+            if task_programs:
+                policy = prior_plan.task_policy
+                executor = TaskExecutor()
+                if any(
+                    executor.execute(
+                        sample_id=artifact.sample_id,
+                        schema=schema,
+                        database=database,
+                        program=program,
+                        positive_rate_min=policy.positive_rate_min,
+                        positive_rate_max=policy.positive_rate_max,
+                    ) is None
+                    for program in task_programs
+                ):
+                    raise ValueError("pre-sampled task program failed post-materialization validation")
+            break
+        except ValueError as error:
+            last_error = error
+    else:
+        assert last_error is not None
+        raise ValueError(
+            f"unable to materialize {artifact.sample_id} after {attempts} attempts: {last_error}"
+        ) from last_error
     runtime_record = runtime.record(
         project_version=item.project_version,
         config_digest=item.config_digest,
@@ -661,6 +753,8 @@ def _generate_one_database_instance(
         plan=plan,
         database=database,
         report=report,
+        prior_plan=prior_plan,
+        task_programs=task_programs,
     )
     row_count = sum(table.row_count for table in database.tables)
     return _InstanceWorkResult(
@@ -682,6 +776,7 @@ def _generate_one_database_instance(
                     ).items()
                 )
             ),
+            "prior_family": plan.prior_family,
         },
     )
 
