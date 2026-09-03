@@ -100,6 +100,14 @@ class RelationAttributeCandidate:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RandomColumnCandidate:
+    """A target table with feature columns eligible for random selection."""
+
+    table_id: str
+    feature_column_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class FutureEventCandidate:
     foreign_key_id: str
     entity_table_id: str
@@ -187,6 +195,31 @@ def relation_attribute_candidates(
                             class_count=class_count,
                         )
                     )
+    return tuple(result)
+
+
+def random_column_candidates(
+    schema: PhysicalSchema, database: DatabaseInstance
+) -> tuple[RandomColumnCandidate, ...]:
+    """Enumerate tables that can support RDBPFN-style random target tasks.
+
+    A task masks one feature column and learns its thresholded values from the
+    remaining columns. Requiring at least two usable features leaves at least
+    one physical feature after masking, matching the intended pretraining
+    setting rather than producing target-only tasks.
+    """
+    result: list[RandomColumnCandidate] = []
+    for table in schema.tables:
+        feature_column_ids = _usable_feature_columns(
+            schema, database, table.table_id
+        )
+        if len(feature_column_ids) >= 2:
+            result.append(
+                RandomColumnCandidate(
+                    table_id=table.table_id,
+                    feature_column_ids=feature_column_ids,
+                )
+            )
     return tuple(result)
 
 
@@ -417,6 +450,64 @@ def build_relation_attribute_task(
             else float(np.mean(labels == 1))
         ),
         parameters=(("class_count", candidate.class_count), ("support_fraction", support_fraction)),
+    )
+    return _planned_if_visible(
+        schema, database, plan, labels, support, query
+    )
+
+
+def build_random_column_task(
+    *, task_id: str, sample_id: str, schema: PhysicalSchema,
+    database: DatabaseInstance, candidate: RandomColumnCandidate,
+    seed: int, support_fraction: float, min_support_rows: int,
+    min_query_rows: int, min_class_count_per_split: int,
+) -> PlannedTask | None:
+    """Build one RDBPFN-compatible random target-column task.
+
+    This mirrors ``_augment_batch_with_random_targets`` in RDBPFN: choose one
+    usable feature, draw a threshold uniformly between its observed minimum
+    and maximum, and define the binary target as ``value > threshold``.
+    """
+    if not candidate.feature_column_ids:
+        return None
+    rng = _rng(seed)
+    target_index = int(rng.integers(0, len(candidate.feature_column_ids)))
+    target_column_id = candidate.feature_column_ids[target_index]
+    raw_values = database.table(candidate.table_id).column(target_column_id)
+    scores = _numeric(raw_values)
+    col_min = float(np.min(scores))
+    col_max = float(np.max(scores))
+    diff = col_max - col_min
+    threshold = (
+        col_min
+        if diff <= 1e-6
+        else col_min + float(rng.uniform()) * diff
+    )
+    labels = (scores > threshold).astype(np.int8)
+    split = _stratified_split(
+        labels, rng, support_fraction=support_fraction,
+        min_support_rows=min_support_rows, min_query_rows=min_query_rows,
+        min_class_count=min_class_count_per_split,
+    )
+    if split is None:
+        return None
+    support, query = split
+    plan = TaskPlan(
+        task_id=task_id, sample_id=sample_id, instance_id=database.instance_id,
+        schema_id=schema.schema_id, mechanism=TaskMechanism.RANDOM_COLUMN,
+        prediction_type=PredictionType.CLASSIFICATION,
+        target_table_id=candidate.table_id,
+        source_table_id=candidate.table_id,
+        target_column_id=target_column_id,
+        split_strategy="stratified_rows", seed=seed,
+        masked_column_ids=(target_column_id,),
+        classification_kind=ClassificationKind.BINARY,
+        threshold=threshold,
+        realized_positive_rate=float(np.mean(labels == 1)),
+        parameters=(
+            ("target_column_index", target_index),
+            ("support_fraction", support_fraction),
+        ),
     )
     return _planned_if_visible(
         schema, database, plan, labels, support, query
@@ -993,6 +1084,13 @@ def mechanism_labels(
     )
     if plan.mechanism is TaskMechanism.RELATIONAL_CLASSIFICATION:
         return composite_labels(schema, database, plan)
+    if plan.mechanism is TaskMechanism.RANDOM_COLUMN:
+        if plan.target_column_id is None or plan.threshold is None:
+            raise ValueError("random column plan is missing target metadata")
+        values = database.table(plan.target_table_id).column(
+            plan.target_column_id
+        )
+        return (_numeric(values) > float(plan.threshold)).astype(np.int8)
     if plan.mechanism is TaskMechanism.INTERACTION_RESPONSE:
         candidate = InteractionCandidate(
             event_table_id=plan.target_table_id,
@@ -2361,13 +2459,15 @@ def _sigmoid(z: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "TargetSample",
-    "RelationAttributeCandidate", "FutureEventCandidate",
+    "RelationAttributeCandidate", "RandomColumnCandidate", "FutureEventCandidate",
     "FutureEventAttributeCandidate", "TemporalAggregateCandidate",
     "CompositeCandidate",
     "relation_attribute_candidates", "future_event_candidates",
+    "random_column_candidates",
     "future_event_attribute_candidates", "temporal_aggregate_candidates",
     "generate_composite_candidates",
-    "build_relation_attribute_task", "build_future_event_existence_task",
+    "build_relation_attribute_task", "build_random_column_task",
+    "build_future_event_existence_task",
     "build_history_gated_future_activity_task",
     "build_history_gated_future_inactive_task",
     "build_history_gated_future_active_task",

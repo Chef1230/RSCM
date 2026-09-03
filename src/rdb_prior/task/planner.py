@@ -20,12 +20,14 @@ from rdb_prior.task.mechanisms import (
     build_history_gated_future_inactive_task,
     build_history_gated_future_active_task,
     build_relation_attribute_task,
+    build_random_column_task,
     build_temporal_relational_aggregate_task,
     generate_composite_candidates,
     interaction_candidates,
     future_event_attribute_candidates,
     future_event_candidates,
     relation_attribute_candidates,
+    random_column_candidates,
     temporal_aggregate_candidates,
 )
 from rdb_prior.task.model import (
@@ -43,6 +45,7 @@ _DEFAULT_MECHANISM_WEIGHTS = (
     (TaskMechanism.FUTURE_EVENT_ATTRIBUTE_CONDITION, 0.20),
     (TaskMechanism.TEMPORAL_RELATIONAL_AGGREGATE, 0.20),
     (TaskMechanism.INTERACTION_RESPONSE, 0.15),
+    (TaskMechanism.RANDOM_COLUMN, 0.0),
 )
 
 
@@ -218,11 +221,15 @@ class TaskPlannerConfig:
         mechanisms = tuple(item[0] for item in self.mechanism_weights)
         if len(set(mechanisms)) != len(mechanisms):
             raise ValueError("mechanism_weights contains duplicate mechanisms")
+        has_positive_mechanism_weight = False
         for mechanism, weight in self.mechanism_weights:
             if not isinstance(mechanism, TaskMechanism):
                 raise TypeError("mechanism_weights keys must be TaskMechanism")
-            if weight <= 0:
-                raise ValueError("mechanism weights must be positive")
+            if weight < 0:
+                raise ValueError("mechanism weights must be non-negative")
+            has_positive_mechanism_weight |= weight > 0
+        if not has_positive_mechanism_weight:
+            raise ValueError("at least one mechanism weight must be positive")
 
 
 class TaskPlanner:
@@ -254,6 +261,9 @@ class TaskPlanner:
             TaskMechanism.INTERACTION_RESPONSE: list(
                 interaction_candidates(schema, database)
             ),
+            TaskMechanism.RANDOM_COLUMN: list(
+                random_column_candidates(schema, database)
+            ),
         }
         composite_pools = _composite_candidate_pools(schema, database, self.config)
         pools[TaskMechanism.RELATIONAL_CLASSIFICATION] = [
@@ -271,7 +281,11 @@ class TaskPlanner:
         for attempt in range(self.config.max_attempts_per_database):
             if len(generated) >= self.config.tasks_per_database:
                 break
-            available = [mechanism for mechanism in mechanisms if pools.get(mechanism)]
+            available = [
+                mechanism
+                for mechanism, weight in zip(mechanisms, weights)
+                if weight > 0 and pools.get(mechanism)
+            ]
             if not available:
                 break
             available_weights = [weights[mechanisms.index(mechanism)] for mechanism in available]
@@ -292,6 +306,10 @@ class TaskPlanner:
                 task = build_relation_attribute_task(
                     **common, positive_rate_min=self.config.positive_rate_min,
                     positive_rate_max=self.config.positive_rate_max,
+                )
+            elif mechanism is TaskMechanism.RANDOM_COLUMN:
+                task = build_random_column_task(
+                    **common,
                 )
             elif mechanism is TaskMechanism.ENTITY_FUTURE_EVENT_EXISTENCE:
                 task = build_future_event_existence_task(

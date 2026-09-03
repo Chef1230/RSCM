@@ -146,12 +146,12 @@ class RDBPFNConverter:
             "target_column": _LABEL_COLUMN,
             "target_table": target_table.name,
             "task_type": prediction_type,
+            "mechanism": plan.mechanism.value,
         }
         if plan.prediction_type is PredictionType.CLASSIFICATION:
             task_metadata["num_classes"] = int(len(np.unique(labels)))
         if plan.composite_spec is not None:
             composite = plan.composite_spec
-            task_metadata["mechanism"] = plan.mechanism.value
             task_metadata["composite_family"] = composite.family.value
             task_metadata["composite_aggregate_operators"] = [
                 aggregate.operator.value

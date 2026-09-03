@@ -141,8 +141,11 @@ def validate_task(
 
     issues.extend(_validate_route_supervision(schema, plan.target_table_id, plan.route_supervision))
     if not (
-        plan.mechanism is TaskMechanism.RELATION_ATTRIBUTE
-        and plan.source_column_id is None
+        plan.mechanism is TaskMechanism.RANDOM_COLUMN
+        or (
+            plan.mechanism is TaskMechanism.RELATION_ATTRIBUTE
+            and plan.source_column_id is None
+        )
     ):
         # Composite tasks carry several required paths, so the single
         # source-table endpoint check does not apply; composite path
@@ -151,7 +154,10 @@ def validate_task(
             issues.extend(_validate_required_route_endpoint(schema, plan))
 
     issues.extend(_validate_mechanism_labels(schema, database, task))
-    if plan.mechanism is TaskMechanism.RELATION_ATTRIBUTE:
+    if plan.mechanism in {
+        TaskMechanism.RELATION_ATTRIBUTE,
+        TaskMechanism.RANDOM_COLUMN,
+    }:
         issues.extend(_validate_relation_attribute(schema, task))
     if plan.mechanism in {
         TaskMechanism.ENTITY_FUTURE_EVENT_EXISTENCE,

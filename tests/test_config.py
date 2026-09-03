@@ -28,9 +28,17 @@ from rdb_prior.config import (
     load_task_pipeline_config,
 )
 from rdb_prior.instance.planner import InstancePlannerConfig
+from rdb_prior.task.model import TaskMechanism
 
 
 class SchemaConfigTests(unittest.TestCase):
+    def test_template_exposes_random_column_mechanism(self) -> None:
+        config = load_task_pipeline_config(
+            PROJECT_ROOT / "configs" / "template.yaml"
+        )
+        weights = dict(config.planner.mechanism_weights)
+        self.assertEqual(0.0, weights[TaskMechanism.RANDOM_COLUMN])
+
     def test_refactor_v2_loads_complete_pipeline(self) -> None:
         config_path = PROJECT_ROOT / "configs" / "refactor_v2.yaml"
         schema = load_schema_pipeline_config(config_path)
@@ -397,7 +405,7 @@ class SchemaConfigTests(unittest.TestCase):
         )
         self.assertEqual(4, config.planner.tasks_per_database)
         self.assertEqual(3, config.num_workers)
-        self.assertEqual(7, len(config.planner.mechanism_weights))
+        self.assertEqual(8, len(config.planner.mechanism_weights))
 
         stdout = StringIO()
         with redirect_stdout(stdout):

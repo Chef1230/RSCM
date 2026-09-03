@@ -256,8 +256,9 @@ value/weight lists.
 - `task`: tasks per database, mechanism weights, support/query sizing,
   classification quality thresholds, future cutoff/horizon ranges,
   history-gated soft-label propensity weights, temporal aggregate
-  window-regime mixing (short/long/repeated), and interaction-response beta
-  weight / invert-probability ranges.
+  window-regime mixing (short/long/repeated), interaction-response beta
+  weight / invert-probability ranges, and the RDBPFN-style random-column
+  target mechanism.
 - `task_generation`: instance selection, deterministic sharding, progress,
   overwrite behavior and project version.
 - `rdbpfn_export`: task selection, train/validation split, compressed NPZ,
@@ -365,7 +366,8 @@ OUTPUT_DIR/task/
     validation.json
 ```
 
-V1 implements `relation_attribute` and `future_event_existence`. Relation
+V1 implements `relation_attribute`, `future_event_existence`, and
+`random_column`. Relation
 attribute tasks mask the physical target column and split Event rows in time
 order. Future-event tasks label Entity rows from one Entity -> Event FK in a
 sampled future window; every Event table is hidden after the common cutoff.
@@ -401,6 +403,16 @@ with `interaction_invert_probability`, so one mechanism covers both response/CTR
 and ignore. Labels replay exactly from `plan.seed` plus the stored
 `beta_u` / `beta_f` / `beta_s` / `beta_p` / `base_rate` / `invert` /
 `label_retries` parameters.
+
+`random_column` mirrors RDBPFN's target augmentation at task-generation time:
+it samples one usable feature column from the target table, samples a threshold
+uniformly between that column's observed minimum and maximum, and labels rows
+with `value > threshold`. The selected feature is masked from the exported
+database, the threshold is stored in `task_plan.json`, and labels are therefore
+replayable. Enable it by adding `random_column` to `task.mechanism_weights`.
+The generated DBB/H5 output can then be used with RDBPFN's existing
+`targets_per_subset` and `group_size_for_augment_data` training options; those
+options add further random target episodes on top of the persisted tasks.
 
 The stage-04 output is directly loadable by RDBPFN:
 

@@ -375,6 +375,8 @@ task:
     # 事件行级曝光→响应 (CTR); 每条 Event 行预测一次曝光是否产生响应,
     # 实体在自身时间前有历史曝光才入样本; invert 时正例表示 ignore
     interaction_response: 0.15
+    # RDBPFN 风格: 随机选择一个可用特征列, 在其值域内采样阈值生成二分类目标
+    random_column: 0.0
 
   # <== 分布参数: support/query 划分。
   support_fraction: 0.70         # (0, 1)

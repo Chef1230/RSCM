@@ -36,6 +36,7 @@ class TaskMechanism(str, Enum):
     TEMPORAL_RELATIONAL_AGGREGATE = "temporal_relational_aggregate"
     INTERACTION_RESPONSE = "interaction_response"
     RELATIONAL_CLASSIFICATION = "relational_classification"
+    RANDOM_COLUMN = "random_column"
 
 
 class ClassificationKind(str, Enum):
@@ -299,6 +300,8 @@ class TaskPlan:
                 self.parameter_map.get("base_rate"),
                 self.parameter_map.get("invert"),
             )
+        elif self.mechanism is TaskMechanism.RANDOM_COLUMN:
+            extra = (self.threshold,)
         else:
             extra = ()
         # Composite tasks are fully described by their composite spec; include
@@ -456,6 +459,15 @@ class TaskPlan:
                 raise ValueError(
                     "relational classification requires an exact required path"
                 )
+        elif self.mechanism is TaskMechanism.RANDOM_COLUMN:
+            if self.prediction_type is not PredictionType.CLASSIFICATION:
+                raise ValueError("random column must be classification")
+            if self.target_column_id is None:
+                raise ValueError("random column requires target_column_id")
+            if self.target_column_id not in self.masked_column_ids:
+                raise ValueError("random column target must be masked")
+            if self.threshold is None:
+                raise ValueError("random column requires a threshold")
 
     def to_dict(self) -> dict[str, Any]:
         return {

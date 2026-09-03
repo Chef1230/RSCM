@@ -1262,7 +1262,10 @@ class TaskGenerationTests(unittest.TestCase):
                 for label in task.plan.route_supervision
                 if label.role is RouteRole.REQUIRED
             ]
-            self.assertTrue(required, mechanism.value)
+            if mechanism is TaskMechanism.RANDOM_COLUMN:
+                self.assertFalse(required, mechanism.value)
+            else:
+                self.assertTrue(required, mechanism.value)
             expected = mechanism_labels(schema, database, task.plan)
             np.testing.assert_array_equal(
                 task.data.support_labels,

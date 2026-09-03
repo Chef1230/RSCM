@@ -62,26 +62,26 @@ echo "=== Stage 03: task ==="
 # ---------------------------------------------------------------------------
 # Stage 04: DBB export + DFS depth 1 -> H5
 # ---------------------------------------------------------------------------
-echo "=== Stage 04: export + DFS depth 1 ==="
-H5_RUN_DFS=true \
-  H5_EXPORT=true \
-  DFS_DEPTH=1 \
-  LOG_LEVEL=WARNING \
-  PROGRESS_BAR=1 \
-  H5_OUTPUT="${H5_OUTPUT_BASE}/rdbpfn_tasks_dfs-1.h5" \
-  "${BASH_BIN}" "${SCRIPT_DIR}/04_rdbpfn_export.sh" "${CONFIG_PATH}"
+# echo "=== Stage 04: export + DFS depth 1 ==="
+# H5_RUN_DFS=true \
+#   H5_EXPORT=true \
+#   DFS_DEPTH=1 \
+#   LOG_LEVEL=WARNING \
+#   PROGRESS_BAR=1 \
+#   H5_OUTPUT="${H5_OUTPUT_BASE}/rdbpfn_tasks_dfs-1.h5" \
+#   "${BASH_BIN}" "${SCRIPT_DIR}/04_rdbpfn_export.sh" "${CONFIG_PATH}"
 
 # ---------------------------------------------------------------------------
 # Stage 04: DFS depth 2 -> H5 (reuses existing DBB datasets)
 # ---------------------------------------------------------------------------
-# echo "=== Stage 04: export + DFS depth 2 ==="
-# H5_RUN_DFS=true \
-#   H5_EXPORT=true \
-#   DFS_DEPTH=2 \
-#   LOG_LEVEL=WARNING \
-#   PROGRESS_BAR=1 \
-#   H5_OUTPUT="${H5_OUTPUT_BASE}/rdbpfn_tasks_dfs-2.h5" \
-#   "${BASH_BIN}" "${SCRIPT_DIR}/04_rdbpfn_export.sh" "${CONFIG_PATH}"
+echo "=== Stage 04: export + DFS depth 2 ==="
+H5_RUN_DFS=true \
+  H5_EXPORT=true \
+  DFS_DEPTH=2 \
+  LOG_LEVEL=WARNING \
+  PROGRESS_BAR=1 \
+  H5_OUTPUT="${H5_OUTPUT_BASE}/rdbpfn_tasks_dfs-2.h5" \
+  "${BASH_BIN}" "${SCRIPT_DIR}/04_rdbpfn_export.sh" "${CONFIG_PATH}"
 
 echo "=== generate_v3 complete ==="
 echo "  depth-1 H5: ${H5_OUTPUT_BASE}/rdbpfn_tasks_dfs-1.h5"
