@@ -38,6 +38,65 @@ class SchemaConfigTests(unittest.TestCase):
         )
         weights = dict(config.planner.mechanism_weights)
         self.assertEqual(0.0, weights[TaskMechanism.RANDOM_COLUMN])
+    def test_prior_mode_is_explicit_and_strict(self) -> None:
+        self.assertIsNone(
+            load_instance_pipeline_config(
+                PROJECT_ROOT / "configs" / "template.yaml"
+            ).prior
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "prior.yaml"
+
+            path.write_text("prior:\n  mode: legacy\n", encoding="utf-8")
+            self.assertIsNone(load_instance_pipeline_config(path).prior)
+
+            path.write_text(
+                "prior:\n"
+                "  mode: legacy\n"
+                "  state_dimension: 3\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SchemaConfigError, "legacy.*state_dimension"):
+                load_instance_pipeline_config(path)
+
+            path.write_text("prior:\n  mode: compositional\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                SchemaConfigError,
+                "compositional.*database_family_weights",
+            ):
+                load_instance_pipeline_config(path)
+
+            path.write_text(
+                "prior:\n"
+                "  mode: compositional\n"
+                "  database_family_weights:\n"
+                "    temporal_event: 1.0\n"
+                "  state_dimension: 3\n",
+                encoding="utf-8",
+            )
+            configured = load_instance_pipeline_config(path).prior
+            self.assertIsNotNone(configured)
+            assert configured is not None
+            self.assertEqual(
+                (("temporal_event", 1.0),),
+                tuple(
+                    (family.value, weight)
+                    for family, weight in configured.database_family_weights
+                ),
+            )
+            self.assertEqual(3, configured.state_dimension)
+
+            path.write_text(
+                "prior:\n"
+                "  mode: compositional\n"
+                "  database_family_weights:\n"
+                "    temporal_event: 1.0\n"
+                "  motif_family_weights: {}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SchemaConfigError, "unknown option"):
+                load_instance_pipeline_config(path)
+
 
     def test_refactor_v2_loads_complete_pipeline(self) -> None:
         config_path = PROJECT_ROOT / "configs" / "refactor_v2.yaml"

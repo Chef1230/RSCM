@@ -615,13 +615,8 @@ _INSTANCE_GENERATION_OPTIONS = {
 }
 
 _PRIOR_OPTIONS = {
+    "mode",
     "database_family_weights",
-    "motif_family_weights",
-    "families",
-    "relational_scm",
-    "relational_tree",
-    "temporal_event",
-    "rule_process",
     "task_policy",
     "state_dimension",
 }
@@ -1375,12 +1370,29 @@ def _role_scm_mapping(
 
 
 def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
-    """Parse the optional P0/P1 prior section without changing old configs."""
+    """Parse an explicit P1 prior mode without changing old configs."""
     if not raw:
         return None
+    mode = raw.get("mode")
+    if mode not in {"legacy", "compositional"}:
+        raise SchemaConfigError(
+            "config.prior.mode must be 'legacy' or 'compositional'"
+        )
+    if mode == "legacy":
+        conflicting = sorted(set(raw) - {"mode"})
+        if conflicting:
+            raise SchemaConfigError(
+                "config.prior.mode 'legacy' cannot set: "
+                + ", ".join(conflicting)
+            )
+        return None
+
     weights_raw = raw.get("database_family_weights")
     if weights_raw is None:
-        return None
+        raise SchemaConfigError(
+            "config.prior.mode 'compositional' requires "
+            "database_family_weights"
+        )
     weights = _weight_mapping(
         weights_raw,
         (),
@@ -1388,6 +1400,10 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
         "config.prior.database_family_weights",
         sort_keys=True,
     )
+    if not weights:
+        raise SchemaConfigError(
+            "config.prior.database_family_weights must be non-empty"
+        )
     policy_raw = _mapping(raw.get("task_policy", {}), "config.prior.task_policy")
     _reject_unknown(policy_raw, _PRIOR_TASK_POLICY_OPTIONS, "config.prior.task_policy")
     defaults = TaskPolicyPlan()
