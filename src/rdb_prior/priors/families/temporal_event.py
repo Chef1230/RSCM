@@ -8,7 +8,7 @@ from math import exp
 import numpy as np
 
 from rdb_prior.compilation.model import ColumnKind, PhysicalSchema
-from rdb_prior.generation.latent import generate_latent_registry
+from rdb_prior.generation.state import SharedStateRegistry
 from rdb_prior.instance.plan import (
     ColumnMechanismPlan,
     InstancePlan,
@@ -19,7 +19,7 @@ from rdb_prior.instance.plan import (
 from rdb_prior.priors.model import DatabasePriorPlan, PriorFamily
 
 
-_TIME_FAMILIES = ("stationary", "seasonal", "churn")
+_TIME_FAMILIES = ("stationary", "seasonal", "churn", "renewal")
 _ATTRIBUTE_FAMILIES = ("linear", "cam")
 
 
@@ -36,7 +36,12 @@ def bind_temporal_event_plan(
     """
     if prior_plan.family is not PriorFamily.TEMPORAL_EVENT:
         raise ValueError("temporal binder requires temporal_event prior")
-    latents = generate_latent_registry(plan)
+    state_plan = replace(
+        plan,
+        shared_state_ids=tuple(item.state_id for item in prior_plan.shared_states),
+        shared_states=prior_plan.shared_states,
+    )
+    states = SharedStateRegistry.from_plan(state_plan)
     table_plans = {item.table_id: item for item in plan.tables}
     population_mechanisms: list[PopulationMechanismPlan] = []
     temporal_processes: list[TemporalProcessPlan] = []
@@ -53,13 +58,13 @@ def bind_temporal_event_plan(
             if "temporal_state_id" in parameters else None
         )
         foreign_key_id = bundle.edge_bindings[0].foreign_key_id
-        entity_latent = latents.table(entity_id).values
+        entity_state = states.state(state_id)
         old_table = table_plans[event_id]
-        entity_count = len(entity_latent)
+        entity_count = len(entity_state)
         baseline = max(0.20, old_table.population.row_count / max(1, entity_count))
         rng = np.random.Generator(np.random.PCG64DXSM(prior_plan.seed ^ old_table.temporal_seed))
-        coefficients = rng.normal(0.0, 0.45, size=entity_latent.shape[1])
-        score = entity_latent @ coefficients
+        coefficients = rng.normal(0.0, 0.45, size=entity_state.shape[1])
+        score = entity_state @ coefficients
         score = (score - np.mean(score)) / max(float(np.std(score)), 1e-6)
         intensity = np.clip(baseline * np.exp(0.55 * score), 0.03, max(12.0, baseline * 6.0))
         dispersion = float(rng.uniform(1.5, 5.0))
@@ -91,6 +96,10 @@ def bind_temporal_event_plan(
                     ("baseline_intensity", baseline),
                     ("intensity_family", str(rng.choice(_ATTRIBUTE_FAMILIES))),
                     ("planned_event_count", total),
+                    (
+                        "count_state_weights",
+                        rng.normal(0.0, 0.45, size=entity_state.shape[1]).tolist(),
+                    ),
                 ),
             )
         )
@@ -103,7 +112,27 @@ def bind_temporal_event_plan(
                 temporal_state_ids=(
                     () if temporal_state_id is None else (temporal_state_id,)
                 ),
-                parameters=(("foreign_key_id", foreign_key_id), ("seasonal_strength", float(rng.uniform(0.25, 0.75))), ("churn_exponent", float(rng.uniform(1.25, 3.0)))),
+                parameters=(
+                    ("foreign_key_id", foreign_key_id),
+                    ("seasonal_strength", float(rng.uniform(0.25, 0.75))),
+                    ("churn_exponent", float(rng.uniform(1.25, 3.0))),
+                    (
+                        "state_churn_weights",
+                        rng.normal(0.0, 0.35, size=entity_state.shape[1]).tolist(),
+                    ),
+                    (
+                        "state_seasonal_phase_weights",
+                        rng.normal(0.0, 0.45, size=entity_state.shape[1]).tolist(),
+                    ),
+                    (
+                        "state_active_interval_weights",
+                        rng.normal(0.0, 0.35, size=entity_state.shape[1]).tolist(),
+                    ),
+                    (
+                        "state_renewal_scale_weights",
+                        rng.normal(0.0, 0.35, size=entity_state.shape[1]).tolist(),
+                    ),
+                ),
             )
         )
         parent_columns = tuple(
@@ -119,7 +148,12 @@ def bind_temporal_event_plan(
                         family=str(rng.choice(_ATTRIBUTE_FAMILIES)),
                         parent_column_ids=parent_columns,
                         shared_state_ids=(state_id,),
-                        parameters=(("time_weight", float(rng.uniform(0.2, 1.0))), ("history_weight", float(rng.uniform(0.2, 1.0)))),
+                        parameters=(
+                            ("time_weight", float(rng.uniform(0.2, 1.0))),
+                            ("history_weight", float(rng.uniform(0.2, 1.0))),
+                            ("mechanism_seed", int(rng.integers(0, 2**63 - 1))),
+                            ("noise_scale", float(rng.uniform(0.12, 0.35))),
+                        ),
                     )
                 )
     return replace(

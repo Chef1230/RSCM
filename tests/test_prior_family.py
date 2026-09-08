@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 import tempfile
@@ -20,7 +21,11 @@ from rdb_prior.artifacts import (
     load_schema_artifact,
 )
 from rdb_prior.compilation.compiler import PhysicalSchemaCompiler
+from rdb_prior.compilation.model import ColumnKind, PhysicalDataType
 from rdb_prior.generation.database import DatabaseGenerator
+from rdb_prior.generation.encoding import encode_feature_score
+from rdb_prior.generation.state import SharedStateRegistry
+from rdb_prior.generation.temporal_processes import _temporal_ticks
 from rdb_prior.instance.plan import InstancePlan
 from rdb_prior.instance.planner import InstancePlanner, InstancePlannerConfig
 from rdb_prior.pipeline import (
@@ -172,6 +177,121 @@ class PriorFamilyTests(unittest.TestCase):
                 positive_rate_max=1.0,
             )
         )
+
+    def test_static_state_signal_drives_realized_event_counts(self) -> None:
+        _runtime, _schema, _prior, plan, _database = self._temporal_fixture()
+        mechanism = plan.population_mechanisms[0]
+        state = SharedStateRegistry.from_plan(plan).state(
+            mechanism.state_ids[0]
+        )
+        parameters = dict(mechanism.parameters)
+        signal = state @ np.asarray(parameters["count_state_weights"])
+        counts = np.asarray(parameters["entity_event_counts"])
+        self.assertGreater(np.corrcoef(signal, counts)[0, 1], 0.25)
+
+    def test_temporal_column_mechanism_family_changes_materialized_events(self) -> None:
+        _runtime, schema, _prior, plan, _database = self._temporal_fixture()
+        event_id = plan.population_mechanisms[0].table_id
+        event_features = {
+            column.column_id
+            for column in schema.table(event_id).columns
+            if column.kind is ColumnKind.FEATURE
+        }
+        linear = replace(
+            plan,
+            column_mechanisms=tuple(
+                replace(item, family="linear")
+                if item.column_id in event_features
+                else item
+                for item in plan.column_mechanisms
+            ),
+        )
+        cam = replace(
+            plan,
+            column_mechanisms=tuple(
+                replace(item, family="cam")
+                if item.column_id in event_features
+                else item
+                for item in plan.column_mechanisms
+            ),
+        )
+        linear_event = DatabaseGenerator().generate(
+            schema=schema, plan=linear
+        ).table(event_id)
+        cam_event = DatabaseGenerator().generate(
+            schema=schema, plan=cam
+        ).table(event_id)
+        changed = []
+        for column_id in event_features:
+            left = linear_event.column(column_id)
+            right = cam_event.column(column_id)
+            changed.append(
+                not np.array_equal(
+                    left,
+                    right,
+                    equal_nan=left.dtype.kind == "f",
+                )
+            )
+        self.assertTrue(any(changed))
+
+    def test_static_state_changes_every_temporal_time_family(self) -> None:
+        parameters = {
+            "seasonal_strength": 0.7,
+            "churn_exponent": 1.3,
+            "state_churn_weights": [0.8, 0.6, 0.4],
+            "state_seasonal_phase_weights": [0.7, 0.5, 0.3],
+            "state_active_interval_weights": [0.9, 0.7, 0.5],
+            "state_renewal_scale_weights": [0.6, 0.4, 0.2],
+        }
+        low_state = np.asarray([-2.0, -2.0, -2.0])
+        high_state = np.asarray([2.0, 2.0, 2.0])
+        for family in ("stationary", "seasonal", "churn", "renewal"):
+            left = _temporal_ticks(
+                np.random.Generator(np.random.PCG64DXSM(81)),
+                family,
+                24,
+                low_state,
+                parameters,
+            )
+            right = _temporal_ticks(
+                np.random.Generator(np.random.PCG64DXSM(81)),
+                family,
+                24,
+                high_state,
+                parameters,
+            )
+            self.assertTrue(np.all((left >= 0.0) & (left <= 1.0)))
+            self.assertTrue(np.all(np.diff(left) >= 0.0))
+            self.assertFalse(np.allclose(left, right), family)
+
+    def test_temporal_encoder_preserves_categorical_missingness(self) -> None:
+        _runtime, schema, _prior, plan, _database = self._temporal_fixture()
+        event_id = plan.population_mechanisms[0].table_id
+        source = next(
+            column
+            for column in schema.table(event_id).columns
+            if column.kind is ColumnKind.FEATURE
+        )
+        column = replace(
+            source,
+            data_type=PhysicalDataType.TEXT,
+            nullable=True,
+        )
+        values = encode_feature_score(
+            np.linspace(-3.0, 3.0, 96),
+            column,
+            schema.table(event_id).role,
+            np.random.Generator(np.random.PCG64DXSM(123)),
+            cardinality=8,
+            db_start=plan.calendar_start_seconds,
+            db_end=plan.calendar_end_seconds,
+            categorical_dirichlet_alpha=1.0,
+            categorical_signal_strength=1.0,
+            missing_rate=0.5,
+        )
+        self.assertEqual("U", values.dtype.kind)
+        self.assertTrue(np.any(values == ""))
+        self.assertTrue(np.any(values != ""))
 
     def test_legacy_instance_plan_and_artifact_readers_remain_compatible(self) -> None:
         runtime, schema, prior, plan, database = self._temporal_fixture()

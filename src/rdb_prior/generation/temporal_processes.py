@@ -6,15 +6,19 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from rdb_prior.compilation.model import ColumnKind, PhysicalDataType, PhysicalSchema
-from rdb_prior.generation.latent import generate_latent_registry
+from rdb_prior.compilation.model import ColumnKind, PhysicalSchema
+from rdb_prior.generation.encoding import encode_feature_score
 from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.generation.state import SharedStateRegistry
 from rdb_prior.generation.state_trajectory import (
     StateTrajectory,
     TemporalStateRegistry,
 )
-from rdb_prior.instance.plan import InstancePlan, PopulationPlan
+from rdb_prior.instance.plan import (
+    ColumnMechanismPlan,
+    InstancePlan,
+    PopulationPlan,
+)
 from rdb_prior.priors.model import StateVisibility, TransitionClock
 
 
@@ -35,9 +39,10 @@ def resolve_temporal_population_plan(
         return _resolve_stateful_temporal_population_plan(schema, plan, entity_database)
     if plan.prior_family != "temporal_event" or not plan.population_mechanisms:
         return plan
-    latents = generate_latent_registry(plan)
+    shared_states = SharedStateRegistry.from_plan(plan)
     table_plans = {item.table_id: item for item in plan.tables}
     resolved: list = []
+    changed_table_ids: set[str] = set()
     for mechanism in plan.population_mechanisms:
         if mechanism.family != "negative_binomial" or mechanism.parent_table_id is None:
             resolved.append(mechanism)
@@ -46,12 +51,17 @@ def resolve_temporal_population_plan(
         entity_id = mechanism.parent_table_id
         event_id = mechanism.table_id
         entity = entity_database.table(entity_id)
-        state = latents.table(entity_id).values
+        if not mechanism.state_ids:
+            raise ValueError("temporal population mechanism lacks shared state")
+        state = shared_states.state(mechanism.state_ids[0])
         row_count = entity.row_count
         rng = np.random.Generator(
             np.random.PCG64DXSM(plan.table(event_id).temporal_seed ^ 0x5EED5EED)
         )
-        z_weights = rng.normal(0.0, 0.45, size=state.shape[1])
+        z_weights = np.asarray(
+            parameters.get("count_state_weights", rng.normal(0.0, 0.45, size=state.shape[1])),
+            dtype=np.float64,
+        )
         z_score = _standardize(state @ z_weights)
         x_score = _entity_attribute_score(schema, entity_id, entity.columns, rng)
         family = str(parameters.get("intensity_family", "linear"))
@@ -83,6 +93,7 @@ def resolve_temporal_population_plan(
                 parameters=draft_table.population.parameters + (("state_attribute_conditioned", 1.0),),
             ),
         )
+        changed_table_ids.add(event_id)
         resolved.append(
             replace(
                 mechanism,
@@ -94,11 +105,12 @@ def resolve_temporal_population_plan(
                 ),
             )
         )
-    return replace(
+    resolved_plan = replace(
         plan,
         tables=tuple(table_plans[table_id] for table_id in plan.generation_order),
         population_mechanisms=tuple(resolved),
     )
+    return _replan_downstream_populations(schema, resolved_plan, changed_table_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +149,7 @@ def _apply_stateless_temporal_event_processes(
     """Replace P1 Event FK/time/feature values with one shared process."""
     if plan.prior_family != "temporal_event" or not plan.population_mechanisms:
         return database
-    latents = generate_latent_registry(plan)
+    shared_states = SharedStateRegistry.from_plan(plan)
     tables = {item.table_id: item for item in database.tables}
     process_by_table = {item.table_id: item for item in plan.temporal_processes}
     columns_by_id = {item.column_id: item for item in plan.column_mechanisms}
@@ -149,96 +161,117 @@ def _apply_stateless_temporal_event_processes(
         foreign_key = foreign_keys[str(parameters["foreign_key_id"])]
         event_table = schema.table(mechanism.table_id)
         entity_id = mechanism.parent_table_id
-        entity_latent = latents.table(entity_id).values
+        if not mechanism.state_ids:
+            raise ValueError("temporal population mechanism lacks shared state")
+        entity_state = shared_states.state(mechanism.state_ids[0])
         entity_table = tables[entity_id]
         event = tables[mechanism.table_id]
         row_count = event.row_count
         table_seed = sum((index + 1) * ord(char) for index, char in enumerate(mechanism.table_id))
         rng = np.random.Generator(np.random.PCG64DXSM(plan.global_seed ^ table_seed))
         count_values = parameters.get("entity_event_counts")
-        if isinstance(count_values, list) and len(count_values) == len(entity_latent):
+        if isinstance(count_values, list) and len(count_values) == len(entity_state):
             assignments = np.repeat(
-                np.arange(len(entity_latent), dtype=np.int64),
+                np.arange(len(entity_state), dtype=np.int64),
                 np.asarray(count_values, dtype=np.int64),
             )
             if len(assignments) != row_count:
                 raise ValueError("resolved temporal population no longer matches Event table rows")
         else:
-            coefficients = rng.normal(0.0, 0.5, size=entity_latent.shape[1])
-            score = entity_latent @ coefficients
+            coefficients = rng.normal(0.0, 0.5, size=entity_state.shape[1])
+            score = entity_state @ coefficients
             probability = np.exp(0.55 * (score - score.max()))
             probability /= probability.sum()
-            assignments = rng.choice(len(entity_latent), size=row_count, p=probability).astype(np.int64)
+            assignments = rng.choice(len(entity_state), size=row_count, p=probability).astype(np.int64)
         values = dict(event.columns)
         values[foreign_key.child_column_id] = assignments
         process = process_by_table.get(mechanism.table_id)
         if process is not None:
-            values.update(_event_values(schema, event_table, plan, assignments, entity_latent, _entity_attribute_score(schema, entity_id, entity_table.columns, rng), process, columns_by_id, rng))
+            values.update(
+                _event_values(
+                    event_table,
+                    plan,
+                    assignments,
+                    entity_state,
+                    entity_table,
+                    process,
+                    columns_by_id,
+                    rng,
+                )
+            )
         tables[mechanism.table_id] = TableData(table_id=mechanism.table_id, columns=values)
     return DatabaseInstance(instance_id=database.instance_id, schema_id=database.schema_id, plan_id=database.plan_id, tables=tuple(tables[table.table_id] for table in schema.tables))
 
 
-def _event_values(schema, event_table, plan, assignments, entity_latent, entity_attributes, process, column_mechanisms, rng):
+def _event_values(
+    event_table,
+    plan: InstancePlan,
+    assignments: np.ndarray,
+    entity_state: np.ndarray,
+    entity_table: TableData,
+    process,
+    column_mechanisms: dict[str, ColumnMechanismPlan],
+    rng: np.random.Generator,
+) -> dict[str, np.ndarray]:
     start = plan.calendar_start_seconds
     end = plan.calendar_end_seconds
     if start is None or end is None:
         raise ValueError("temporal prior requires a database calendar")
     rows = len(assignments)
-    family = process.family
+    parameters = dict(process.parameters)
     raw = np.empty(rows, dtype=np.float64)
-    for entity_index in range(len(entity_latent)):
+    for entity_index in range(len(entity_state)):
         indices = np.flatnonzero(assignments == entity_index)
-        if not len(indices):
-            continue
-        if family == "churn":
-            exponent = float(dict(process.parameters).get("churn_exponent", 2.0))
-            ticks = rng.random(len(indices)) ** exponent
-        elif family == "seasonal":
-            strength = float(dict(process.parameters).get("seasonal_strength", 0.5))
-            candidates = rng.random(max(len(indices) * 3, 8))
-            acceptance = (1.0 + strength * np.sin(2.0 * np.pi * candidates)) / (1.0 + strength)
-            accepted = candidates[rng.random(len(candidates)) <= acceptance]
-            if len(accepted) < len(indices):
-                accepted = np.concatenate((accepted, rng.random(len(indices) - len(accepted))))
-            ticks = accepted[: len(indices)]
-        else:
-            ticks = rng.random(len(indices))
-        raw[indices] = np.sort(ticks)
+        if len(indices):
+            raw[indices] = _temporal_ticks(
+                rng, process.family, len(indices), entity_state[entity_index], parameters
+            )
     times = (start + raw * (end - start)).astype(np.int64)
-    output: dict[str, np.ndarray] = {}
-    for column in event_table.columns:
-        if column.kind is ColumnKind.TIME:
-            output[column.column_id] = times
-    history = np.zeros(rows, dtype=np.float64)
-    for entity_index in np.unique(assignments):
-        indices = np.flatnonzero(assignments == entity_index)
-        ranked = indices[np.argsort(times[indices], kind="stable")]
-        history[ranked] = np.arange(len(ranked), dtype=np.float64)
-    history /= max(float(np.max(history)), 1.0)
-    state = entity_latent[assignments]
-    state_score = state @ rng.normal(0.0, 0.45, size=state.shape[1])
-    attribute_score = entity_attributes[assignments]
+    output = {
+        column.column_id: times
+        for column in event_table.columns
+        if column.kind is ColumnKind.TIME
+    }
+    history = _event_history(assignments, times)
     time_score = (times - start) / max(end - start, 1)
+    table_plan = plan.table(event_table.table_id)
+    state = entity_state[assignments]
     for column in event_table.columns:
         if column.kind is not ColumnKind.FEATURE:
             continue
         mechanism = column_mechanisms.get(column.column_id)
-        parameters = {} if mechanism is None else dict(mechanism.parameters)
-        score = state_score + 0.45 * attribute_score + float(parameters.get("time_weight", 0.5)) * time_score + float(parameters.get("history_weight", 0.5)) * history + rng.normal(0.0, 0.25, size=rows)
-        output[column.column_id] = _encode(score, column.data_type)
+        score = _execute_column_mechanism(
+            mechanism,
+            state,
+            entity_table.columns,
+            assignments,
+            time_score,
+            history,
+            rng,
+        )
+        output[column.column_id] = encode_feature_score(
+            score,
+            column,
+            event_table.role,
+            rng,
+            cardinality=int(table_plan.parameter_map["categorical_cardinality"]),
+            db_start=start,
+            db_end=end,
+            categorical_dirichlet_alpha=float(
+                table_plan.parameter_map.get("categorical_dirichlet_alpha", 1.0)
+            ),
+            categorical_signal_strength=float(
+                table_plan.parameter_map.get("categorical_signal_strength", 1.0)
+            ),
+            missing_rate=float(table_plan.parameter_map["missing_rate"]),
+            long_tail_enabled=bool(
+                table_plan.parameter_map.get("long_tail_enabled", 0.0)
+            ),
+            long_tail_alpha=float(
+                table_plan.parameter_map.get("long_tail_alpha", 1.0)
+            ),
+        )
     return output
-
-
-def _encode(score: np.ndarray, data_type: PhysicalDataType) -> np.ndarray:
-    score = np.nan_to_num(np.asarray(score, dtype=np.float64), nan=0.0, posinf=12.0, neginf=-12.0)
-    if data_type is PhysicalDataType.DOUBLE:
-        return score.astype(np.float64)
-    if data_type is PhysicalDataType.INTEGER:
-        return np.rint(10.0 + 3.0 * score).astype(np.int64)
-    if data_type is PhysicalDataType.BOOLEAN:
-        return (score > np.median(score)).astype(bool)
-    levels = np.mod(np.floor((score - score.min()) * 3.0), 8).astype(np.int64)
-    return np.asarray([f"v_{item}" for item in levels], dtype="U8")
 
 
 def _entity_attribute_score(schema, table_id, columns, rng):
@@ -265,6 +298,95 @@ def _standardize(values):
     return (values - values.mean()) / max(float(values.std()), 1e-6)
 
 
+
+
+def _event_history(assignments: np.ndarray, times: np.ndarray) -> np.ndarray:
+    history = np.zeros(len(assignments), dtype=np.float64)
+    for entity_index in np.unique(assignments):
+        indices = np.flatnonzero(assignments == entity_index)
+        ranked = indices[np.argsort(times[indices], kind="stable")]
+        history[ranked] = np.arange(len(ranked), dtype=np.float64)
+    return history / max(float(history.max(initial=0.0)), 1.0)
+
+
+def _temporal_ticks(rng, family: str, count: int, state: np.ndarray, parameters: dict[str, object]) -> np.ndarray:
+    """Sample one ordered state-conditioned time process in [0, 1]."""
+    active = 0.15 + 0.85 * _sigmoid(_state_projection(state, parameters, "state_active_interval_weights"))
+    if family == "seasonal":
+        strength = float(parameters.get("seasonal_strength", 0.5))
+        phase = _state_projection(state, parameters, "state_seasonal_phase_weights")
+        candidates = rng.random(max(count * 4, 12))
+        acceptance = (1.0 + strength * np.sin(2.0 * np.pi * (candidates + phase))) / (1.0 + strength)
+        accepted = candidates[rng.random(len(candidates)) <= acceptance]
+        if len(accepted) < count:
+            accepted = np.concatenate((accepted, rng.random(count - len(accepted))))
+        return np.sort(accepted[:count] * active)
+    if family == "churn":
+        exponent = max(0.45, float(parameters.get("churn_exponent", 2.0)) + _softplus(_state_projection(state, parameters, "state_churn_weights")))
+        return np.sort(rng.random(count) ** exponent * active)
+    if family == "renewal":
+        scale = active * np.exp(np.clip(_state_projection(state, parameters, "state_renewal_scale_weights"), -2.0, 2.0)) / max(count, 1)
+        return np.clip(np.cumsum(rng.exponential(scale, size=count)), 0.0, active)
+    if family != "stationary":
+        raise ValueError(f"unsupported temporal process family: {family}")
+    return np.sort(rng.random(count) * active)
+
+
+def _state_projection(state: np.ndarray, parameters: dict[str, object], key: str) -> float:
+    weights = np.asarray(parameters.get(key, ()), dtype=np.float64)
+    if weights.shape != state.shape:
+        return 0.0
+    return float(np.dot(state, weights) / max(np.sqrt(len(state)), 1.0))
+
+
+def _sigmoid(value: float) -> float:
+    return float(1.0 / (1.0 + np.exp(-np.clip(value, -20.0, 20.0))))
+
+
+def _softplus(value: float) -> float:
+    return float(np.logaddexp(0.0, np.clip(value, -30.0, 30.0)))
+
+
+def _execute_column_mechanism(mechanism: ColumnMechanismPlan | None, state: np.ndarray, entity_columns: dict[str, np.ndarray], assignments: np.ndarray, time_score: np.ndarray, history: np.ndarray, fallback_rng: np.random.Generator) -> np.ndarray:
+    """Execute the sampled Linear or CAM event-attribute mechanism."""
+    if mechanism is None:
+        return state.mean(axis=1) + 0.5 * time_score + 0.5 * history + fallback_rng.normal(0.0, 0.25, size=len(time_score))
+    parameters = dict(mechanism.parameters)
+    rng = np.random.Generator(np.random.PCG64DXSM(int(parameters.get("mechanism_seed", 0))))
+    parent = _column_parent_matrix(mechanism.parent_column_ids, entity_columns, assignments)
+    if mechanism.family == "linear":
+        score = state @ rng.normal(0.0, 0.55, size=state.shape[1])
+        if parent.shape[1]:
+            score += parent @ rng.normal(0.0, 0.45, size=parent.shape[1])
+    elif mechanism.family == "cam":
+        state_frequency = np.exp(rng.uniform(-0.45, 0.45, size=state.shape[1]))
+        score = np.sum(rng.normal(0.0, 0.7, size=state.shape[1]) * np.sin(state_frequency * state), axis=1)
+        if parent.shape[1]:
+            parent_frequency = np.exp(rng.uniform(-0.45, 0.45, size=parent.shape[1]))
+            score += np.sum(rng.normal(0.0, 0.55, size=parent.shape[1]) * np.tanh(parent_frequency * parent), axis=1)
+    else:
+        raise ValueError(f"unsupported temporal column mechanism: {mechanism.family}")
+    score += float(parameters.get("time_weight", 0.5)) * time_score
+    score += float(parameters.get("history_weight", 0.5)) * history
+    score += rng.normal(0.0, float(parameters.get("noise_scale", 0.25)), size=len(score))
+    return np.asarray(score, dtype=np.float64)
+
+
+def _column_parent_matrix(column_ids: tuple[str, ...], columns: dict[str, np.ndarray], assignments: np.ndarray) -> np.ndarray:
+    values: list[np.ndarray] = []
+    for column_id in column_ids:
+        if column_id not in columns:
+            continue
+        raw = np.asarray(columns[column_id])
+        if raw.dtype.kind in {"b", "i", "u", "f"}:
+            numeric = raw.astype(np.float64)
+        else:
+            _categories, numeric = np.unique(raw.astype(str), return_inverse=True)
+            numeric = numeric.astype(np.float64)
+        values.append(_standardize(np.nan_to_num(numeric, nan=0.0))[assignments])
+    if not values:
+        return np.empty((len(assignments), 0), dtype=np.float64)
+    return np.column_stack(values)
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,11 +454,19 @@ def _resolve_stateful_temporal_population_plan(
                 ),
             )
         )
-    return replace(
+    resolved_plan = replace(
         plan,
         tables=tuple(table_plans[table_id] for table_id in plan.generation_order),
         population_mechanisms=tuple(resolved),
     )
+    changed_table_ids = {
+        item.table_id
+        for item in plan.population_mechanisms
+        if item.family == "negative_binomial"
+        and item.parent_table_id is not None
+        and item.table_id in table_plans
+    }
+    return _replan_downstream_populations(schema, resolved_plan, changed_table_ids)
 
 
 def _apply_stateful_temporal_event_processes(
@@ -379,6 +509,7 @@ def _apply_stateful_temporal_event_processes(
                 mechanism,
                 process,
                 schedule,
+                tables[mechanism.parent_table_id],
             )
         )
         tables[mechanism.table_id] = TableData(
@@ -471,7 +602,15 @@ def _stateful_event_schedule(
                 float(attribute_score[entity_index]),
                 base_rate,
             )
-            event_time = now + float(entity_rng.exponential(1.0 / rate))
+            event_time = now + _stateful_wait(
+                entity_rng,
+                process,
+                z,
+                rate,
+                now,
+                start,
+                end,
+            )
             clock = temporal_plan.transition.clock
             if clock is TransitionClock.EVENT_DRIVEN:
                 if event_time > end:
@@ -656,6 +795,111 @@ def _state_rate(
     return max(base_rate * conditioned * np.exp(0.35 * z_effect + 0.20 * attribute_score), 1e-12)
 
 
+def _stateful_wait(
+    rng: np.random.Generator,
+    process,
+    state: np.ndarray,
+    rate: float,
+    now: float,
+    start: int,
+    end: int,
+) -> float:
+    """Draw one inter-arrival duration from the configured state-aware family."""
+    parameters = dict(process.parameters)
+    elapsed = (now - start) / max(float(end - start), 1.0)
+    active = 0.15 + 0.85 * _sigmoid(
+        _state_projection(state, parameters, "state_active_interval_weights")
+    )
+    adjusted_rate = max(rate * active, 1e-12)
+    if process.family == "seasonal":
+        strength = float(parameters.get("seasonal_strength", 0.5))
+        phase = _state_projection(
+            state, parameters, "state_seasonal_phase_weights"
+        )
+        adjusted_rate *= max(
+            0.05,
+            1.0 + strength * np.sin(2.0 * np.pi * (elapsed + phase)),
+        )
+    elif process.family == "churn":
+        exponent = max(
+            0.1,
+            float(parameters.get("churn_exponent", 2.0))
+            + _softplus(
+                _state_projection(state, parameters, "state_churn_weights")
+            ),
+        )
+        adjusted_rate *= np.exp(-exponent * elapsed)
+    elif process.family == "renewal":
+        scale = np.exp(
+            -np.clip(
+                _state_projection(
+                    state, parameters, "state_renewal_scale_weights"
+                ),
+                -2.0,
+                2.0,
+            )
+        )
+        return float(rng.gamma(shape=2.0, scale=scale / (2.0 * adjusted_rate)))
+    elif process.family != "stationary":
+        raise ValueError(f"unsupported temporal process family: {process.family}")
+    return float(rng.exponential(1.0 / max(adjusted_rate, 1e-12)))
+
+
+def _replan_downstream_populations(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+    changed_table_ids: set[str],
+) -> InstancePlan:
+    """Propagate final Event population changes to dependent child tables."""
+    if not changed_table_ids:
+        return plan
+    tables = {item.table_id: item for item in plan.tables}
+    changed = set(changed_table_ids)
+    for table_id in plan.generation_order:
+        if table_id in changed:
+            continue
+        incoming = [
+            foreign_key
+            for foreign_key in schema.foreign_keys
+            if foreign_key.child_table_id == table_id
+            and foreign_key.parent_table_id in changed
+            and foreign_key.relation_strategy != "lookup_assignment"
+        ]
+        if not incoming:
+            continue
+        table = tables[table_id]
+        parent_counts = [
+            tables[foreign_key.parent_table_id].population.row_count
+            for foreign_key in incoming
+        ]
+        multiplier = float(table.population.parameter_map.get("multiplier", 1.0))
+        if table.population.strategy == "joint_bridge_population" and len(parent_counts) > 1:
+            target = int(
+                round(np.sqrt(np.prod(parent_counts, dtype=np.float64)) * multiplier)
+            )
+        else:
+            target = int(round(max(parent_counts) * multiplier))
+        target = max(1, target)
+        parameters = tuple(
+            item
+            for item in table.population.parameters
+            if item[0] != "upstream_population_replanned"
+        ) + (("upstream_population_replanned", 1.0),)
+        tables[table_id] = replace(
+            table,
+            population=PopulationPlan(
+                strategy=table.population.strategy,
+                row_count=target,
+                parameters=parameters,
+            ),
+        )
+        changed.add(table_id)
+    return replace(
+        plan,
+        tables=tuple(tables[table_id] for table_id in plan.generation_order),
+    )
+
+
 def _softmax(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=np.float64)
     shifted = values - np.max(values)
@@ -669,7 +913,9 @@ def _stateful_event_values(
     mechanism,
     process,
     schedule: _StatefulEventSchedule,
+    entity_table: TableData,
 ) -> dict[str, np.ndarray]:
+    """Use the same sampled column mechanism and physical encoder as P1."""
     table = schema.table(mechanism.table_id)
     temporal_state_id = process.temporal_state_ids[0]
     temporal_plan = next(
@@ -679,39 +925,66 @@ def _stateful_event_values(
         temporal_plan.shared_state_id
     )[schedule.assignments]
     rng = np.random.Generator(
-        np.random.PCG64DXSM(temporal_plan.seed ^ plan.table(mechanism.table_id).feature_seed)
+        np.random.PCG64DXSM(
+            temporal_plan.seed ^ plan.table(mechanism.table_id).feature_seed
+        )
     )
-    state_score = schedule.state_indices.astype(np.float64)
-    state_score = _standardize(state_score)
-    z_score = static @ rng.normal(0.0, 0.4, size=static.shape[1])
+    state_score = _standardize(schedule.state_indices.astype(np.float64))
     time_score = (
         (schedule.times - plan.calendar_start_seconds)
         / max(plan.calendar_end_seconds - plan.calendar_start_seconds, 1)
     )
     history = schedule.history / max(float(schedule.history.max(initial=0.0)), 1.0)
-    output: dict[str, np.ndarray] = {}
+    mechanisms = {
+        item.column_id: item for item in plan.column_mechanisms
+    }
+    table_plan = plan.table(mechanism.table_id)
     feature_columns = [
         item for item in table.columns if item.kind is ColumnKind.FEATURE
     ]
-    emission_column_id = (
-        feature_columns[0].column_id if feature_columns else None
-    )
+    emission_column_id = feature_columns[0].column_id if feature_columns else None
+    output: dict[str, np.ndarray] = {}
     for column in table.columns:
         if column.kind is ColumnKind.TIME:
             output[column.column_id] = schedule.times
-        elif column.kind is ColumnKind.FEATURE:
-            score = (
-                z_score
-                + 0.7 * state_score
-                + 0.5 * time_score
-                + 0.4 * history
-                + rng.normal(0.0, 0.2, size=len(schedule.times))
-            )
-            if column.column_id == emission_column_id and (
-                temporal_plan.visibility is StateVisibility.EVENT_EMISSION
-            ):
-                score += 1.25 * state_score
-            output[column.column_id] = _encode(score, column.data_type)
+            continue
+        if column.kind is not ColumnKind.FEATURE:
+            continue
+        score = _execute_column_mechanism(
+            mechanisms.get(column.column_id),
+            static,
+            entity_table.columns,
+            schedule.assignments,
+            time_score,
+            history,
+            rng,
+        )
+        if column.column_id == emission_column_id and (
+            temporal_plan.visibility is StateVisibility.EVENT_EMISSION
+        ):
+            score += 1.25 * state_score
+        output[column.column_id] = encode_feature_score(
+            score,
+            column,
+            table.role,
+            rng,
+            cardinality=int(table_plan.parameter_map["categorical_cardinality"]),
+            db_start=plan.calendar_start_seconds,
+            db_end=plan.calendar_end_seconds,
+            categorical_dirichlet_alpha=float(
+                table_plan.parameter_map.get("categorical_dirichlet_alpha", 1.0)
+            ),
+            categorical_signal_strength=float(
+                table_plan.parameter_map.get("categorical_signal_strength", 1.0)
+            ),
+            missing_rate=float(table_plan.parameter_map["missing_rate"]),
+            long_tail_enabled=bool(
+                table_plan.parameter_map.get("long_tail_enabled", 0.0)
+            ),
+            long_tail_alpha=float(
+                table_plan.parameter_map.get("long_tail_alpha", 1.0)
+            ),
+        )
     return output
 __all__ = [
     "TemporalEventMaterialization",

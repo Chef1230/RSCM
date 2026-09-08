@@ -9,7 +9,6 @@ import numpy as np
 from rdb_prior.compilation.model import (
     ColumnKind,
     PhysicalColumn,
-    PhysicalDataType,
     PhysicalSchema,
     PhysicalTable,
 )
@@ -21,6 +20,11 @@ from rdb_prior.instance.plan import (
     InstancePlan,
     TableMechanismPlan,
     TemporalFamily,
+)
+from rdb_prior.generation.encoding import (
+    apply_missing as _apply_missing,
+    encode_feature_score,
+    softmax_codes as _softmax_codes,
 )
 from rdb_prior.schema.spec import TableRole
 from rdb_prior.time_bounds import assert_within_interval
@@ -80,7 +84,7 @@ def generate_table_features(
                 table_plan.parameter_map.get("mlp_dropout_rate", 0.0)
             ),
         )
-        encoded = _encode_signal(
+        values[column.column_id] = encode_feature_score(
             signal,
             column,
             table.role,
@@ -98,12 +102,9 @@ def generate_table_features(
                     "categorical_signal_strength", 1.0
                 )
             ),
-        )
-        values[column.column_id] = _apply_missing(
-            encoded,
-            column,
-            rng,
-            table_plan.parameter_map["missing_rate"],
+            missing_rate=table_plan.parameter_map["missing_rate"],
+            # Feature strategies already consumed this table's long-tail draw.
+            long_tail_enabled=False,
         )
     return values
 
@@ -339,122 +340,6 @@ def _seasonal_ticks(
     ticks = np.sort(accepted[:count])
     return np.clip(ticks, 0.0, float(span))
 
-
-def _encode_signal(
-    signal: np.ndarray,
-    column: PhysicalColumn,
-    role: TableRole,
-    rng: np.random.Generator,
-    *,
-    cardinality: int,
-    db_start: int,
-    db_end: int,
-    categorical_dirichlet_alpha: float,
-    categorical_signal_strength: float,
-) -> np.ndarray:
-    if column.unique:
-        order = np.argsort(signal, kind="stable")
-        unique = np.empty(len(signal), dtype=np.int64)
-        unique[order] = np.arange(len(signal), dtype=np.int64)
-        if column.data_type is PhysicalDataType.TEXT:
-            return np.char.add("v", unique.astype(str))
-        return unique
-    if column.data_type is PhysicalDataType.DOUBLE:
-        return signal.astype(np.float64)
-    if column.data_type is PhysicalDataType.INTEGER:
-        if role is TableRole.LOOKUP:
-            return _softmax_codes(
-                signal,
-                min(cardinality, len(signal)),
-                rng,
-                dirichlet_alpha=categorical_dirichlet_alpha,
-                signal_strength=categorical_signal_strength,
-            )
-        return np.rint(signal * float(rng.uniform(2.0, 20.0))).astype(np.int64)
-    if column.data_type is PhysicalDataType.BOOLEAN:
-        threshold = float(np.quantile(signal, rng.uniform(0.3, 0.7)))
-        return (signal > threshold).astype(np.int8)
-    if column.data_type is PhysicalDataType.TEXT:
-        codes = _softmax_codes(
-            signal,
-            min(cardinality, len(signal)),
-            rng,
-            dirichlet_alpha=categorical_dirichlet_alpha,
-            signal_strength=categorical_signal_strength,
-        )
-        return np.char.add("v", codes.astype(str))
-    if column.data_type is PhysicalDataType.TIMESTAMP:
-        return (db_start + signal * 86_400).clip(
-            db_start, db_end
-        ).astype(np.int64)
-    raise ValueError(f"unsupported physical data type: {column.data_type}")
-
-
-def _softmax_codes(
-    signal: np.ndarray,
-    cardinality: int,
-    rng: np.random.Generator,
-    *,
-    dirichlet_alpha: float,
-    signal_strength: float,
-) -> np.ndarray:
-    """Sample one category id per row from softmax over signal logits.
-
-    score[k] = strength * signal[i] * projection[k] + log(class_prior[k])
-    with class_prior ~ Dirichlet(alpha) and projection ~ N(0, 1). The
-    Gumbel-max trick turns each row's softmax into an argmax over
-    ``logits + gumbel`` noise, vectorized across rows so large tables stay
-    fast. The Dirichlet prior controls class-frequency imbalance (alpha << 1
-    concentrates mass on few classes); the strength controls how strongly the
-    signal drives the category while keeping the causal link intact.
-    """
-    rows = len(signal)
-    if rows == 0:
-        return np.empty(0, dtype=np.int64)
-    cardinality = max(1, min(cardinality, rows))
-    if cardinality == 1:
-        return np.zeros(rows, dtype=np.int64)
-
-    class_prior = rng.dirichlet(np.full(cardinality, float(dirichlet_alpha)))
-    log_prior = np.log(np.maximum(class_prior, 1e-12))
-    projection = rng.normal(size=cardinality)
-
-    out = np.empty(rows, dtype=np.int64)
-    step = 2048  # bounds peak memory at ~step * cardinality * 3 float64.
-    for start in range(0, rows, step):
-        stop = min(rows, start + step)
-        block = signal[start:stop]
-        # Clip U into (0, 1) so -log(-log(U)) stays finite.
-        uniform = rng.random((stop - start, cardinality))
-        gumbel = -np.log(-np.log(np.clip(uniform, 1e-12, 1.0 - 1e-12)))
-        logits = signal_strength * block[:, None] * projection[None, :]
-        logits += log_prior[None, :]
-        out[start:stop] = np.argmax(logits + gumbel, axis=1).astype(np.int64)
-    return out
-
-
-def _apply_missing(
-    values: np.ndarray,
-    column: PhysicalColumn,
-    rng: np.random.Generator,
-    missing_rate: float,
-) -> np.ndarray:
-    if not column.nullable or missing_rate <= 0:
-        return values
-    missing = rng.random(len(values)) < missing_rate
-    if len(values) > 0 and missing.all():
-        # validate_database_instance treats a fully-missing column as invalid
-        # (all_missing_feature). Keep one random row observed as a guard; it
-        # only fires when independent per-value masking would wipe the column.
-        missing[rng.integers(len(values))] = False
-    if values.dtype.kind in {"U", "S"}:
-        width = max(1, values.dtype.itemsize // np.dtype("U1").itemsize)
-        result = values.astype(f"<U{width}", copy=True)
-        result[missing] = ""
-        return result
-    result = values.astype(np.float64, copy=True)
-    result[missing] = np.nan
-    return result
 
 
 __all__ = ["generate_table_features"]
