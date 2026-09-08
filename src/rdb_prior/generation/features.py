@@ -14,9 +14,12 @@ from rdb_prior.compilation.model import (
 )
 from rdb_prior.generation.feature_strategies import generate_feature_signal
 from rdb_prior.generation.latent import LatentRegistry
+from rdb_prior.generation.trees.executor import evaluate_forest
+from rdb_prior.generation.trees.model import ForestPlan
 from rdb_prior.generation.model import TableData
 from rdb_prior.instance.plan import (
     EventTemporalMechanism,
+    ColumnMechanismPlan,
     InstancePlan,
     TableMechanismPlan,
     TemporalFamily,
@@ -47,10 +50,10 @@ def generate_table_features(
     if db_start is None or db_end is None:
         raise ValueError("instance plan lacks calendar interval")
     values: dict[str, np.ndarray] = {}
+    mechanisms = {item.column_id: item for item in plan.column_mechanisms}
 
+    # Tree mechanisms may use time regardless of physical column order.
     for column in table.columns:
-        if column.kind in {ColumnKind.PRIMARY_KEY, ColumnKind.FOREIGN_KEY}:
-            continue
         if column.kind is ColumnKind.TIME:
             values[column.column_id] = _generate_time(
                 schema=schema,
@@ -62,28 +65,50 @@ def generate_table_features(
                 db_start=db_start,
                 db_end=db_end,
             )
-            continue
 
-        signal = generate_feature_signal(
-            table_plan.feature_family,
-            context,
-            rng,
-            noise_scale=table_plan.parameter_map["noise_scale"],
-            signal_scale=table_plan.parameter_map["signal_scale"],
-            activation_scale=table_plan.parameter_map["activation_scale"],
-            output_scale=table_plan.parameter_map["output_scale"],
-            long_tail_enabled=bool(
-                table_plan.parameter_map["long_tail_enabled"]
-            ),
-            long_tail_alpha=table_plan.parameter_map["long_tail_alpha"],
-            mlp_depth=int(table_plan.parameter_map.get("mlp_depth", 1)),
-            mlp_hidden_factor=float(
-                table_plan.parameter_map.get("mlp_hidden_factor", 2.0)
-            ),
-            mlp_dropout_rate=float(
-                table_plan.parameter_map.get("mlp_dropout_rate", 0.0)
-            ),
-        )
+    for column in table.columns:
+        if column.kind in {
+            ColumnKind.PRIMARY_KEY,
+            ColumnKind.FOREIGN_KEY,
+            ColumnKind.TIME,
+        }:
+            continue
+        mechanism = mechanisms.get(column.column_id)
+        if (
+            mechanism is not None
+            and mechanism.family == "tree"
+            and plan.prior_family != "temporal_event"
+        ):
+            signal = _tree_feature_signal(
+                mechanism=mechanism,
+                schema=schema,
+                table=table,
+                latents=latents,
+                relations=relations,
+                generated_tables=generated_tables,
+                local_values=values,
+            )
+        else:
+            signal = generate_feature_signal(
+                table_plan.feature_family,
+                context,
+                rng,
+                noise_scale=table_plan.parameter_map["noise_scale"],
+                signal_scale=table_plan.parameter_map["signal_scale"],
+                activation_scale=table_plan.parameter_map["activation_scale"],
+                output_scale=table_plan.parameter_map["output_scale"],
+                long_tail_enabled=bool(
+                    table_plan.parameter_map["long_tail_enabled"]
+                ),
+                long_tail_alpha=table_plan.parameter_map["long_tail_alpha"],
+                mlp_depth=int(table_plan.parameter_map.get("mlp_depth", 1)),
+                mlp_hidden_factor=float(
+                    table_plan.parameter_map.get("mlp_hidden_factor", 2.0)
+                ),
+                mlp_dropout_rate=float(
+                    table_plan.parameter_map.get("mlp_dropout_rate", 0.0)
+                ),
+            )
         values[column.column_id] = encode_feature_score(
             signal,
             column,
@@ -107,6 +132,83 @@ def generate_table_features(
             long_tail_enabled=False,
         )
     return values
+
+
+def _tree_feature_signal(
+    *,
+    mechanism: ColumnMechanismPlan,
+    schema: PhysicalSchema,
+    table: PhysicalTable,
+    latents: LatentRegistry,
+    relations: Mapping[str, np.ndarray],
+    generated_tables: Mapping[str, TableData],
+    local_values: Mapping[str, np.ndarray],
+) -> np.ndarray:
+    """Evaluate a sampled forest against anonymous table/parent context."""
+    payload = dict(mechanism.parameters).get("forest")
+    if not isinstance(payload, Mapping):
+        raise ValueError("tree column mechanism lacks serialized forest")
+    forest = ForestPlan.from_dict(payload)
+    rows = latents.table(table.table_id).values.shape[0]
+    own = latents.table(table.table_id).values
+    parent_latent = np.zeros(rows, dtype=np.float64)
+    parent_feature = np.zeros(rows, dtype=np.float64)
+    history = np.zeros(rows, dtype=np.float64)
+    for foreign_key in schema.foreign_keys:
+        if foreign_key.child_table_id != table.table_id:
+            continue
+        assignments = relations[foreign_key.foreign_key_id]
+        valid = assignments >= 0
+        parent = latents.table(foreign_key.parent_table_id).values
+        parent_latent[valid] = parent[assignments[valid], 0]
+        parent_data = generated_tables.get(foreign_key.parent_table_id)
+        if parent_data is not None:
+            feature = next(
+                (
+                    column for column in schema.table(foreign_key.parent_table_id).columns
+                    if column.kind is ColumnKind.FEATURE
+                ),
+                None,
+            )
+            if feature is not None:
+                numeric = _numeric_feature(parent_data.column(feature.column_id))
+                parent_feature[valid] = numeric[assignments[valid]]
+        for parent_index in np.unique(assignments[valid]):
+            indices = np.flatnonzero(assignments == parent_index)
+            history[indices] = np.arange(len(indices), dtype=np.float64)
+        break
+    time_value = np.zeros(rows, dtype=np.float64)
+    for column in table.columns:
+        if column.kind is ColumnKind.TIME and column.column_id in local_values:
+            time_value = np.asarray(local_values[column.column_id], dtype=np.float64)
+            break
+    if np.any(time_value):
+        time_value = (time_value - time_value.mean()) / max(
+            float(time_value.std()), 1e-6
+        )
+    history /= max(float(history.max(initial=0.0)), 1.0)
+    return evaluate_forest(
+        forest,
+        {
+            "self_latent_0": own[:, 0],
+            "parent_latent_0": parent_latent,
+            "parent_feature_0": parent_feature,
+            "time": time_value,
+            "history": history,
+        },
+        row_count=rows,
+    )
+
+
+def _numeric_feature(values: np.ndarray) -> np.ndarray:
+    raw = np.asarray(values)
+    if raw.dtype.kind in {"b", "i", "u", "f"}:
+        numeric = raw.astype(np.float64)
+    else:
+        _categories, numeric = np.unique(raw.astype(str), return_inverse=True)
+        numeric = numeric.astype(np.float64)
+    numeric = np.nan_to_num(numeric, nan=0.0, posinf=8.0, neginf=-8.0)
+    return (numeric - numeric.mean()) / max(float(numeric.std()), 1e-6)
 
 
 def _causal_context(

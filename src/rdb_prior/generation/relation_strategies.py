@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from rdb_prior.generation.latent import LatentRegistry
+from rdb_prior.generation.trees.executor import evaluate_forest
 from rdb_prior.instance.plan import RelationMechanismPlan
 
 
@@ -21,7 +22,9 @@ def generate_single_relation(
     child = latents.table(plan.child_table_id).values
     parent = latents.table(parent_id)
 
-    if plan.family == "lookup_cpt":
+    if plan.family == "tree_propensity":
+        assignments = _tree_propensity_assignments(child, parent.values, parent.activity, plan, rng)
+    elif plan.family == "lookup_cpt":
         assignments = _cpt_assignments(child, len(parent.activity), rng)
     elif plan.family == "lookup_transition":
         assignments = _transition_assignments(child, len(parent.activity), rng)
@@ -127,6 +130,38 @@ def generate_affinity_bridge(
     ):
         encoded[fk_id] = _apply_optional(values, optional_rate, rng)
     return encoded
+
+
+def _tree_propensity_assignments(
+    child: np.ndarray,
+    parent: np.ndarray,
+    activity: np.ndarray,
+    plan: RelationMechanismPlan,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Draw each parent from directly sampled tree propensity scores."""
+    forest = plan.tree_forest
+    if forest is None:
+        raise ValueError("tree_propensity relation requires a sampled forest")
+    if parent.shape[0] < 1:
+        raise ValueError("tree_propensity relation requires at least one parent")
+    parent_activity = np.log(np.maximum(activity, 1e-12))
+    parent_activity = (parent_activity - parent_activity.mean()) / max(
+        float(parent_activity.std()), 1e-6
+    )
+    values = np.empty(child.shape[0], dtype=np.int64)
+    for row_index, child_value in enumerate(child):
+        scores = evaluate_forest(
+            forest,
+            {
+                "child_latent_0": np.full(parent.shape[0], child_value[0]),
+                "parent_latent_0": parent[:, 0],
+                "parent_activity": parent_activity,
+            },
+            row_count=parent.shape[0],
+        )
+        values[row_index] = _categorical(scores, rng)
+    return values
 
 
 def _softmax_assignments(

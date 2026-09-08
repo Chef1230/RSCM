@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -10,6 +11,8 @@ from rdb_prior.compilation.model import ColumnKind, PhysicalSchema
 from rdb_prior.generation.encoding import encode_feature_score
 from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.generation.state import SharedStateRegistry
+from rdb_prior.generation.trees.executor import evaluate_forest
+from rdb_prior.generation.trees.model import ForestPlan
 from rdb_prior.generation.state_trajectory import (
     StateTrajectory,
     TemporalStateRegistry,
@@ -65,8 +68,23 @@ def resolve_temporal_population_plan(
         z_score = _standardize(state @ z_weights)
         x_score = _entity_attribute_score(schema, entity_id, entity.columns, rng)
         family = str(parameters.get("intensity_family", "linear"))
-        if family == "cam":
-            score = 0.55 * z_score + 0.45 * x_score + 0.25 * np.sin(z_score * x_score)
+        forest_payload = parameters.get("event_intensity_forest")
+        if family == "tree" or isinstance(forest_payload, Mapping):
+            if not isinstance(forest_payload, Mapping):
+                raise ValueError("tree event intensity lacks a serialized forest")
+            score = _tree_intensity_score(
+                ForestPlan.from_dict(forest_payload),
+                schema,
+                entity_id,
+                entity.columns,
+                state,
+            )
+        elif family == "cam":
+            score = (
+                0.55 * z_score
+                + 0.45 * x_score
+                + 0.25 * np.sin(z_score * x_score)
+            )
         else:
             score = 0.60 * z_score + 0.40 * x_score
         baseline = float(parameters["baseline_intensity"])
@@ -274,6 +292,49 @@ def _event_values(
     return output
 
 
+def _tree_intensity_score(
+    forest: ForestPlan,
+    schema: PhysicalSchema,
+    entity_id: str,
+    columns: Mapping[str, np.ndarray],
+    state: np.ndarray,
+) -> np.ndarray:
+    """Evaluate a sampled count-intensity forest without inspecting labels."""
+    feature = next(
+        (
+            column
+            for column in schema.table(entity_id).columns
+            if column.kind is ColumnKind.FEATURE
+        ),
+        None,
+    )
+    if feature is None:
+        entity_feature = np.zeros(state.shape[0], dtype=np.float64)
+    else:
+        entity_feature = _numeric_column(columns[feature.column_id])
+    return evaluate_forest(
+        forest,
+        {
+            "state_0": state[:, 0],
+            "entity_feature_0": entity_feature,
+        },
+        row_count=state.shape[0],
+    )
+
+
+def _numeric_column(values: np.ndarray) -> np.ndarray:
+    raw = np.asarray(values)
+    if raw.dtype.kind in {"b", "i", "u", "f"}:
+        numeric = raw.astype(np.float64)
+        finite = np.isfinite(numeric)
+        fill = float(np.mean(numeric[finite])) if np.any(finite) else 0.0
+        numeric = np.where(finite, numeric, fill)
+    else:
+        _categories, numeric = np.unique(raw.astype(str), return_inverse=True)
+        numeric = numeric.astype(np.float64)
+    return _standardize(numeric)
+
+
 def _entity_attribute_score(schema, table_id, columns, rng):
     table = schema.table(table_id)
     features: list[np.ndarray] = []
@@ -356,8 +417,32 @@ def _execute_column_mechanism(mechanism: ColumnMechanismPlan | None, state: np.n
     if mechanism is None:
         return state.mean(axis=1) + 0.5 * time_score + 0.5 * history + fallback_rng.normal(0.0, 0.25, size=len(time_score))
     parameters = dict(mechanism.parameters)
-    rng = np.random.Generator(np.random.PCG64DXSM(int(parameters.get("mechanism_seed", 0))))
-    parent = _column_parent_matrix(mechanism.parent_column_ids, entity_columns, assignments)
+    parent = _column_parent_matrix(
+        mechanism.parent_column_ids,
+        entity_columns,
+        assignments,
+    )
+    if mechanism.family == "tree":
+        forest_payload = parameters.get("forest")
+        if not isinstance(forest_payload, Mapping):
+            raise ValueError("tree temporal column lacks a serialized forest")
+        return evaluate_forest(
+            ForestPlan.from_dict(forest_payload),
+            {
+                "state_0": state[:, 0],
+                "parent_feature_0": (
+                    parent[:, 0]
+                    if parent.shape[1]
+                    else np.zeros(len(state), dtype=np.float64)
+                ),
+                "time": time_score,
+                "history": history,
+            },
+            row_count=len(state),
+        )
+    rng = np.random.Generator(
+        np.random.PCG64DXSM(int(parameters.get("mechanism_seed", 0)))
+    )
     if mechanism.family == "linear":
         score = state @ rng.normal(0.0, 0.55, size=state.shape[1])
         if parent.shape[1]:
@@ -565,8 +650,22 @@ def _stateful_event_schedule(
     start = plan.calendar_start_seconds
     end = plan.calendar_end_seconds
     span = float(end - start)
-    baseline = float(dict(mechanism.parameters)["baseline_intensity"])
+    mechanism_parameters = dict(mechanism.parameters)
+    baseline = float(mechanism_parameters["baseline_intensity"])
     base_rate = max(baseline / span, 1.0 / max(span * 100.0, 1.0))
+    forest_payload = mechanism_parameters.get("event_intensity_forest")
+    if isinstance(forest_payload, Mapping):
+        intensity_score = _standardize(
+            _tree_intensity_score(
+                ForestPlan.from_dict(forest_payload),
+                schema,
+                entity_id,
+                entity.columns,
+                static,
+            )
+        )
+    else:
+        intensity_score = np.zeros(entity.row_count, dtype=np.float64)
 
     assignments: list[int] = []
     times: list[int] = []
@@ -604,7 +703,8 @@ def _stateful_event_schedule(
                 state_to_index[state],
                 z,
                 float(attribute_score[entity_index]),
-                base_rate,
+                base_rate
+                * float(np.exp(0.55 * np.clip(intensity_score[entity_index], -5.0, 5.0))),
             )
             event_time = now + _stateful_wait(
                 entity_rng,

@@ -90,6 +90,28 @@ class SchemaConfigTests(unittest.TestCase):
                 "prior:\n"
                 "  mode: compositional\n"
                 "  database_family_weights:\n"
+                "    relational_tree: 1.0\n"
+                "  relational_tree:\n"
+                "    tree_count: [2, 3]\n"
+                "    depth: [3, 4]\n"
+                "    threshold_strategy: random\n"
+                "    use_for_attributes: false\n",
+                encoding="utf-8",
+            )
+            tree_configured = load_instance_pipeline_config(path).prior
+            self.assertIsNotNone(tree_configured)
+            assert tree_configured is not None
+            self.assertEqual(2, tree_configured.relational_tree.tree_count_min)
+            self.assertEqual(3, tree_configured.relational_tree.tree_count_max)
+            self.assertEqual(3, tree_configured.relational_tree.depth_min)
+            self.assertEqual(4, tree_configured.relational_tree.depth_max)
+            self.assertEqual("random", tree_configured.relational_tree.threshold_strategy)
+            self.assertFalse(tree_configured.relational_tree.use_for_attributes)
+
+            path.write_text(
+                "prior:\n"
+                "  mode: compositional\n"
+                "  database_family_weights:\n"
                 "    temporal_event: 1.0\n"
                 "  motif_family_weights: {}\n",
                 encoding="utf-8",

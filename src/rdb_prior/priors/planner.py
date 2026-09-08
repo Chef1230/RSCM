@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rdb_prior.compilation.model import PhysicalSchema
+from rdb_prior.compilation.model import ColumnKind, PhysicalSchema
+from rdb_prior.generation.trees.model import ForestPlan
+from rdb_prior.generation.trees.sampler import sample_forest
 from rdb_prior.priors.compatibility import entity_event_candidates
 from rdb_prior.priors.model import (
     AttributePriorKind,
@@ -112,6 +114,39 @@ class PriorCompositionConfig:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RelationTreeConfig:
+    """Bounded direct-prior controls for random relation/attribute forests."""
+
+    tree_count_min: int = 1
+    tree_count_max: int = 8
+    depth_min: int = 2
+    depth_max: int = 6
+    threshold_strategy: str = "extra"
+    use_for_attributes: bool = True
+    use_for_event_intensity: bool = True
+    use_for_relation_propensity: bool = True
+
+    def __post_init__(self) -> None:
+        for name in ("tree_count_min", "tree_count_max", "depth_min", "depth_max"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.tree_count_max < self.tree_count_min:
+            raise ValueError("tree_count_max must be at least tree_count_min")
+        if self.depth_max < self.depth_min:
+            raise ValueError("depth_max must be at least depth_min")
+        if self.threshold_strategy not in {"random", "extra"}:
+            raise ValueError("threshold_strategy must be 'random' or 'extra'")
+        for name in (
+            "use_for_attributes",
+            "use_for_event_intensity",
+            "use_for_relation_propensity",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PriorPlannerConfig:
     # No ``prior`` config must be byte-for-byte legacy in its seed path.
     database_family_weights: tuple[tuple[PriorFamily, float], ...] = ((PriorFamily.LEGACY_ROLE_SCM, 1.0),)
@@ -120,6 +155,7 @@ class PriorPlannerConfig:
     shared_state_family: str = "gaussian_mixture"
     temporal_state: TemporalStateConfig = TemporalStateConfig()
     composition: PriorCompositionConfig | None = None
+    relational_tree: RelationTreeConfig = RelationTreeConfig()
 
     def __post_init__(self) -> None:
         if not isinstance(self.database_family_weights, tuple) or not self.database_family_weights:
@@ -143,6 +179,8 @@ class PriorPlannerConfig:
             raise ValueError("unsupported shared-state family")
         if not isinstance(self.temporal_state, TemporalStateConfig):
             raise TypeError("temporal_state must be TemporalStateConfig")
+        if not isinstance(self.relational_tree, RelationTreeConfig):
+            raise TypeError("relational_tree must be RelationTreeConfig")
         if (
             self.composition is not None
             and not isinstance(self.composition, PriorCompositionConfig)
@@ -189,7 +227,14 @@ class PriorPlanner:
         else:
             components = self.config.composition
             if components.temporal is TemporalPriorKind.STATIC:
-                family = PriorFamily.LEGACY_ROLE_SCM
+                family = (
+                    PriorFamily.RELATIONAL_TREE
+                    if (
+                        components.attribute is AttributePriorKind.TREE
+                        or components.relation is RelationPriorKind.TREE
+                    )
+                    else PriorFamily.LEGACY_ROLE_SCM
+                )
             elif candidates:
                 family = PriorFamily.TEMPORAL_EVENT
             else:
@@ -204,45 +249,60 @@ class PriorPlanner:
         }
         for occurrence in blueprint.motif_occurrences:
             candidate = temporal_by_occurrence.get(occurrence.occurrence_id)
-            if family is not PriorFamily.TEMPORAL_EVENT or candidate is None:
-                bundles.append(self._legacy_bundle(occurrence, semantic_schema))
-                continue
-
-            state_id = f"state_{candidate.entity_table_id}_{occurrence.occurrence_id}"
-            states.append(
-                SharedStatePlan(
-                    state_id=state_id,
-                    owner_table_id=candidate.entity_table_id,
-                    family=self.config.shared_state_family,
-                    dimension=self.config.state_dimension,
-                    seed=runtime.seed("prior", "state", state_id),
-                )
-            )
-            temporal_state_id: str | None = None
-            if self.config.temporal_state.enabled:
-                temporal_state_id = (
-                    f"temporal_{candidate.entity_table_id}_{occurrence.occurrence_id}"
-                )
-                temporal_states.append(
-                    self._temporal_state_plan(
-                        state_id=temporal_state_id,
+            if family is PriorFamily.TEMPORAL_EVENT and candidate is not None:
+                state_id = f"state_{candidate.entity_table_id}_{occurrence.occurrence_id}"
+                states.append(
+                    SharedStatePlan(
+                        state_id=state_id,
                         owner_table_id=candidate.entity_table_id,
+                        family=self.config.shared_state_family,
+                        dimension=self.config.state_dimension,
+                        seed=runtime.seed("prior", "state", state_id),
+                    )
+                )
+                temporal_state_id: str | None = None
+                if self.config.temporal_state.enabled:
+                    temporal_state_id = (
+                        f"temporal_{candidate.entity_table_id}_{occurrence.occurrence_id}"
+                    )
+                    temporal_states.append(
+                        self._temporal_state_plan(
+                            state_id=temporal_state_id,
+                            owner_table_id=candidate.entity_table_id,
+                            shared_state_id=state_id,
+                            runtime=runtime,
+                        )
+                    )
+                bundles.append(
+                    self._temporal_bundle(
+                        occurrence_id=occurrence.occurrence_id,
+                        entity_table_id=candidate.entity_table_id,
+                        event_table_id=candidate.event_table_id,
+                        foreign_key_id=candidate.foreign_key_id,
                         shared_state_id=state_id,
+                        temporal_state_id=temporal_state_id,
+                        components=components,
+                        semantic_schema=semantic_schema,
+                        physical_schema=physical_schema,
                         runtime=runtime,
                     )
                 )
-            bundles.append(
-                self._temporal_bundle(
-                    occurrence_id=occurrence.occurrence_id,
-                    entity_table_id=candidate.entity_table_id,
-                    event_table_id=candidate.event_table_id,
-                    foreign_key_id=candidate.foreign_key_id,
-                    shared_state_id=state_id,
-                    temporal_state_id=temporal_state_id,
-                    components=components,
-                    semantic_schema=semantic_schema,
+                continue
+            if family is PriorFamily.RELATIONAL_TREE and candidate is not None:
+                bundles.append(
+                    self._tree_bundle(
+                        occurrence=occurrence,
+                        entity_table_id=candidate.entity_table_id,
+                        event_table_id=candidate.event_table_id,
+                        foreign_key_id=candidate.foreign_key_id,
+                        components=components,
+                        physical_schema=physical_schema,
+                        semantic_schema=semantic_schema,
+                        runtime=runtime,
+                    )
                 )
-            )
+                continue
+            bundles.append(self._legacy_bundle(occurrence, semantic_schema))
         plan_id = f"prior_plan_{physical_schema.schema_id}"
         seed = runtime.seed("prior", "global")
         composition = PriorCompositionPlan(
@@ -314,10 +374,124 @@ class PriorPlanner:
                 relation=RelationPriorKind.STATE_CONDITIONED_EVENT,
                 temporal=temporal,
             )
+        if family is PriorFamily.RELATIONAL_TREE:
+            return PriorCompositionConfig(
+                attribute=AttributePriorKind.TREE,
+                relation=RelationPriorKind.TREE,
+                temporal=TemporalPriorKind.STATIC,
+            )
         return PriorCompositionConfig(
             attribute=AttributePriorKind.LEGACY_SCM,
             relation=RelationPriorKind.LATENT_AFFINITY,
             temporal=TemporalPriorKind.STATIC,
+        )
+
+    def _forest(
+        self,
+        *,
+        forest_id: str,
+        feature_refs: tuple[str, ...],
+        runtime: RuntimeContext,
+    ) -> ForestPlan:
+        config = self.config.relational_tree
+        return sample_forest(
+            forest_id=forest_id,
+            feature_refs=feature_refs,
+            rng=runtime.numpy_rng("prior", "relational-tree", forest_id),
+            tree_count=(config.tree_count_min, config.tree_count_max),
+            depth=(config.depth_min, config.depth_max),
+            threshold_strategy=config.threshold_strategy,
+        )
+
+    def _tree_bundle(
+        self,
+        *,
+        occurrence: object,
+        entity_table_id: str,
+        event_table_id: str,
+        foreign_key_id: str,
+        components: PriorCompositionConfig,
+        physical_schema: PhysicalSchema,
+        semantic_schema: SemanticSchemaPlan,
+        runtime: RuntimeContext,
+    ) -> MotifMechanismBundle:
+        config = self.config.relational_tree
+        relation_forests: dict[str, object] = {}
+        attribute_forests: dict[str, object] = {}
+        if config.use_for_relation_propensity:
+            relation_forests[foreign_key_id] = self._forest(
+                forest_id=f"forest_relation_{foreign_key_id}",
+                feature_refs=(
+                    "child_latent_0",
+                    "parent_latent_0",
+                    "parent_activity",
+                ),
+                runtime=runtime,
+            ).to_dict()
+        if config.use_for_attributes:
+            for column in physical_schema.table(event_table_id).columns:
+                if column.kind is ColumnKind.FEATURE:
+                    attribute_forests[column.column_id] = self._forest(
+                        forest_id=f"forest_attribute_{column.column_id}",
+                        feature_refs=(
+                            "self_latent_0",
+                            "parent_latent_0",
+                            "parent_feature_0",
+                            "time",
+                            "history",
+                        ),
+                        runtime=runtime,
+                    ).to_dict()
+        entity_role = semantic_schema.table_role(entity_table_id).value
+        event_role = semantic_schema.table_role(event_table_id).value
+        attribute_kind = (
+            AttributePriorKind.TREE
+            if config.use_for_attributes
+            else AttributePriorKind.LEGACY_SCM
+        )
+        relation_kind = (
+            RelationPriorKind.TREE
+            if config.use_for_relation_propensity
+            else RelationPriorKind.LATENT_AFFINITY
+        )
+        return MotifMechanismBundle(
+            bundle_id=f"bundle_{occurrence.occurrence_id}",
+            motif_occurrence_id=occurrence.occurrence_id,
+            family=PriorFamily.RELATIONAL_TREE,
+            node_bindings=(
+                TableMechanismBinding(
+                    table_id=entity_table_id,
+                    mechanism_ids=("tree_parent_context",),
+                ),
+                TableMechanismBinding(
+                    table_id=event_table_id,
+                    mechanism_ids=("tree_relation", "tree_attributes"),
+                ),
+            ),
+            edge_bindings=(
+                RelationMechanismBinding(
+                    foreign_key_id=foreign_key_id,
+                    mechanism_id=(
+                        "tree_propensity"
+                        if config.use_for_relation_propensity
+                        else "latent_affinity"
+                    ),
+                ),
+            ),
+            population_mechanism="legacy",
+            attribute_mechanism=mechanism_ref(attribute_kind),
+            relation_mechanism=mechanism_ref(relation_kind),
+            temporal_mechanism=mechanism_ref(TemporalPriorKind.STATIC),
+            process_mechanism=mechanism_ref(components.process),
+            compatible_task_families=(),
+            parameters=(
+                ("entity_table_id", entity_table_id),
+                ("event_table_id", event_table_id),
+                ("semantic_entity_role", entity_role),
+                ("semantic_event_role", event_role),
+                ("relation_forests", relation_forests),
+                ("attribute_forests", attribute_forests),
+            ),
         )
 
     def _legacy_bundle(
@@ -366,6 +540,8 @@ class PriorPlanner:
         temporal_state_id: str | None,
         components: PriorCompositionConfig,
         semantic_schema: SemanticSchemaPlan,
+        physical_schema: PhysicalSchema,
+        runtime: RuntimeContext,
     ) -> MotifMechanismBundle:
         entity_role = semantic_schema.table_role(entity_table_id)
         event_role = semantic_schema.table_role(event_table_id)
@@ -391,6 +567,49 @@ class PriorPlanner:
             ("semantic_event_column_roles", list(event_column_roles)),
             ("semantic_mechanism_weights", semantic_weights),
         )
+        tree_attribute_forests: dict[str, object] = {}
+        tree_relation_forests: dict[str, object] = {}
+        if components.attribute is AttributePriorKind.TREE:
+            for column in physical_schema.table(event_table_id).columns:
+                if column.kind is ColumnKind.FEATURE:
+                    tree_attribute_forests[column.column_id] = self._forest(
+                        forest_id=f"forest_temporal_attribute_{column.column_id}",
+                        feature_refs=(
+                            "state_0",
+                            "parent_feature_0",
+                            "time",
+                            "history",
+                        ),
+                        runtime=runtime,
+                    ).to_dict()
+        if components.relation is RelationPriorKind.TREE:
+            tree_relation_forests[foreign_key_id] = self._forest(
+                forest_id=f"forest_temporal_relation_{foreign_key_id}",
+                feature_refs=(
+                    "child_latent_0",
+                    "parent_latent_0",
+                    "parent_activity",
+                ),
+                runtime=runtime,
+            ).to_dict()
+        if (
+            components.attribute is AttributePriorKind.TREE
+            and self.config.relational_tree.use_for_event_intensity
+        ):
+            parameters += (
+                (
+                    "event_intensity_forest",
+                    self._forest(
+                        forest_id=f"forest_temporal_intensity_{event_table_id}",
+                        feature_refs=("state_0", "entity_feature_0"),
+                        runtime=runtime,
+                    ).to_dict(),
+                ),
+            )
+        if tree_attribute_forests:
+            parameters += (("attribute_forests", tree_attribute_forests),)
+        if tree_relation_forests:
+            parameters += (("relation_forests", tree_relation_forests),)
         entity_mechanisms = (shared_state_id, "entity_state")
         event_mechanisms = ("event_count", "event_time", "event_attributes")
         temporal_parameters: tuple[tuple[str, object], ...] = (
@@ -421,7 +640,11 @@ class PriorPlanner:
             edge_bindings=(
                 RelationMechanismBinding(
                     foreign_key_id=foreign_key_id,
-                    mechanism_id="state_conditioned_event_fk",
+                    mechanism_id=(
+                        "tree_propensity"
+                        if components.relation is RelationPriorKind.TREE
+                        else "state_conditioned_event_fk"
+                    ),
                 ),
             ),
             population_mechanism="negative_binomial",
@@ -587,4 +810,4 @@ def _sample_transition_matrix(
 
 
 
-__all__ = ["TemporalStateConfig", "PriorPlannerConfig", "PriorPlanner"]
+__all__ = ["RelationTreeConfig", "TemporalStateConfig", "PriorPlannerConfig", "PriorPlanner"]

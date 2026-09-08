@@ -7,6 +7,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from rdb_prior.generation.trees.model import ForestPlan
 from rdb_prior.priors.model import (
     MotifMechanismBundle,
     SharedStatePlan,
@@ -216,6 +217,7 @@ class RelationMechanismPlan:
     optional_rates: tuple[float, ...]
     seed: int
     parameters: tuple[tuple[str, float], ...] = ()
+    tree_forest: ForestPlan | None = None
 
     def __post_init__(self) -> None:
         _identifier("relation_group_id", self.relation_group_id)
@@ -235,6 +237,13 @@ class RelationMechanismPlan:
             if not 0 <= rate < 1:
                 raise ValueError("optional rates must be in [0, 1)")
         _seed("seed", self.seed)
+        if self.tree_forest is not None and not isinstance(
+            self.tree_forest,
+            ForestPlan,
+        ):
+            raise TypeError("tree_forest must be ForestPlan or None")
+        if self.family == "tree_propensity" and self.tree_forest is None:
+            raise ValueError("tree_propensity relation requires tree_forest")
         object.__setattr__(
             self,
             "parameters",
@@ -410,6 +419,11 @@ class InstancePlan:
                     "optional_rates": list(relation.optional_rates),
                     "seed": relation.seed,
                     "parameters": dict(relation.parameters),
+                    "tree_forest": (
+                        None
+                        if relation.tree_forest is None
+                        else relation.tree_forest.to_dict()
+                    ),
                 }
                 for relation in self.relations
             ],
@@ -477,6 +491,11 @@ class InstancePlan:
                 optional_rates=tuple(item["optional_rates"]),
                 seed=item["seed"],
                 parameters=tuple(item.get("parameters", {}).items()),
+                tree_forest=(
+                    None
+                    if item.get("tree_forest") is None
+                    else ForestPlan.from_dict(item["tree_forest"])
+                ),
             )
             for item in data["relations"]
         )

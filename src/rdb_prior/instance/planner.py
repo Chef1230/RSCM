@@ -21,6 +21,7 @@ from rdb_prior.instance.scm_prior import (
     sample_table_scm_parameters,
 )
 from rdb_prior.priors.families.legacy_role_scm import bind_legacy_plan
+from rdb_prior.priors.families.relational_tree import bind_relational_tree_plan
 from rdb_prior.priors.families.temporal_event import bind_temporal_event_plan
 from rdb_prior.priors.model import DatabasePriorPlan, PriorFamily
 from rdb_prior.runtime import RuntimeContext
@@ -639,6 +640,8 @@ class InstancePlanner:
             raise ValueError("prior plan does not belong to physical schema")
         if prior_plan.family is PriorFamily.TEMPORAL_EVENT:
             return bind_temporal_event_plan(schema, plan, prior_plan)
+        if prior_plan.family is PriorFamily.RELATIONAL_TREE:
+            return bind_relational_tree_plan(schema, plan, prior_plan)
         return bind_legacy_plan(plan, prior_plan)
 
     def _event_mechanism(

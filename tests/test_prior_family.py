@@ -50,6 +50,7 @@ from rdb_prior.priors.planner import (
     PriorCompositionConfig,
     PriorPlanner,
     PriorPlannerConfig,
+    RelationTreeConfig,
 )
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
@@ -517,21 +518,30 @@ class PriorFamilyTests(unittest.TestCase):
             NuisancePriorKind.MNAR.value,
             prior.composition.nuisance_plan.mechanism.kind,
         )
-        with self.assertRaisesRegex(ValueError, "only executes column_scm"):
-            InstancePlanner(
-                InstancePlannerConfig(
-                    entity_rows_min=24,
-                    entity_rows_max=24,
-                    lookup_rows_min=4,
-                    lookup_rows_max=4,
-                    max_rows_per_table=256,
-                )
-            ).plan(
-                sample_id="composed_prior",
-                schema=schema,
-                runtime=runtime.child("instance"),
-                prior_plan=prior,
+        plan = InstancePlanner(
+            InstancePlannerConfig(
+                entity_rows_min=24,
+                entity_rows_max=24,
+                lookup_rows_min=4,
+                lookup_rows_max=4,
+                max_rows_per_table=256,
             )
+        ).plan(
+            sample_id="composed_prior",
+            schema=schema,
+            runtime=runtime.child("instance"),
+            prior_plan=prior,
+        )
+        self.assertTrue(
+            any(item.family == "tree" for item in plan.column_mechanisms)
+        )
+        materialized = DatabaseGenerator().materialize(schema=schema, plan=plan)
+        report = validate_database_instance(
+            schema,
+            materialized.plan,
+            materialized.database,
+        )
+        self.assertTrue(report.is_valid, report.issues)
 
     def test_composition_rejects_conflicting_axes(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires a temporal prior"):
@@ -587,11 +597,17 @@ class PriorFamilyTests(unittest.TestCase):
         self.assertEqual(prior, restored.prior_plan)
         self.assertEqual(programs, restored.task_programs)
 
-    def test_reserved_prior_family_fails_explicitly(self) -> None:
-        with self.assertRaisesRegex(ValueError, "reserved but not implemented"):
-            PriorPlannerConfig(
-                database_family_weights=((PriorFamily.RELATIONAL_TREE, 1.0),),
-            )
+    def test_relation_tree_family_is_registered(self) -> None:
+        config = PriorPlannerConfig(
+            database_family_weights=((PriorFamily.RELATIONAL_TREE, 1.0),),
+            relational_tree=RelationTreeConfig(
+                tree_count_min=2,
+                tree_count_max=2,
+                depth_min=2,
+                depth_max=2,
+            ),
+        )
+        self.assertEqual(2, config.relational_tree.tree_count_max)
 
     def test_temporal_program_is_persisted_before_task_pipeline_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

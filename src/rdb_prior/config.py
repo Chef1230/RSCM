@@ -34,7 +34,11 @@ from rdb_prior.priors.model import (
     TaskPolicyPlan,
     TransitionClock,
 )
-from rdb_prior.priors.planner import PriorPlannerConfig, TemporalStateConfig
+from rdb_prior.priors.planner import (
+    PriorPlannerConfig,
+    RelationTreeConfig,
+    TemporalStateConfig,
+)
 from rdb_prior.routing.config import (
     RoutedH5Config,
     RouterModelConfig,
@@ -628,6 +632,7 @@ _PRIOR_OPTIONS = {
     "state_dimension",
     "shared_state",
     "temporal_state",
+    "relational_tree",
 }
 
 _PRIOR_SHARED_STATE_OPTIONS = {"family", "dimension"}
@@ -645,6 +650,14 @@ _PRIOR_STATE_SPACE_OPTIONS = {"values", "terminal_states"}
 _PRIOR_INITIAL_STATE_OPTIONS = {"family"}
 _PRIOR_TRANSITION_OPTIONS = {"clock", "family"}
 _PRIOR_DURATION_OPTIONS = {"family", "state_conditioned"}
+_PRIOR_RELATIONAL_TREE_OPTIONS = {
+    "tree_count",
+    "depth",
+    "threshold_strategy",
+    "use_for_attributes",
+    "use_for_event_intensity",
+    "use_for_relation_propensity",
+}
 _PRIOR_VISIBILITY_OPTIONS = {"family"}
 _DEBUG_OPTIONS = {"persist_private_state_trajectory"}
 
@@ -1452,6 +1465,9 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
         temporal_state=_temporal_state_config(
             _mapping(raw.get("temporal_state", {}), "config.prior.temporal_state")
         ),
+        relational_tree=_relational_tree_config(
+            _mapping(raw.get("relational_tree", {}), "config.prior.relational_tree")
+        ),
     )
 
 
@@ -1470,6 +1486,45 @@ def _shared_state_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "family": shared.get("family", "gaussian_mixture"),
         "dimension": shared.get("dimension", raw.get("state_dimension", 4)),
     }
+
+
+def _relational_tree_config(raw: Mapping[str, Any]) -> RelationTreeConfig:
+    _reject_unknown(
+        raw,
+        _PRIOR_RELATIONAL_TREE_OPTIONS,
+        "config.prior.relational_tree",
+    )
+
+    def pair(name: str, default: tuple[int, int]) -> tuple[int, int]:
+        value = raw.get(name, list(default))
+        if not isinstance(value, list) or len(value) != 2:
+            raise SchemaConfigError(
+                f"config.prior.relational_tree.{name} must be a two-item list"
+            )
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            raise SchemaConfigError(
+                f"config.prior.relational_tree.{name} must contain integers"
+            )
+        return (value[0], value[1])
+
+    try:
+        return RelationTreeConfig(
+            tree_count_min=pair("tree_count", (1, 8))[0],
+            tree_count_max=pair("tree_count", (1, 8))[1],
+            depth_min=pair("depth", (2, 6))[0],
+            depth_max=pair("depth", (2, 6))[1],
+            threshold_strategy=raw.get("threshold_strategy", "extra"),
+            use_for_attributes=raw.get("use_for_attributes", True),
+            use_for_event_intensity=raw.get("use_for_event_intensity", True),
+            use_for_relation_propensity=raw.get(
+                "use_for_relation_propensity",
+                True,
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise SchemaConfigError(
+            f"Invalid config.prior.relational_tree: {error}"
+        ) from error
 
 
 def _temporal_state_config(raw: Mapping[str, Any]) -> TemporalStateConfig:
