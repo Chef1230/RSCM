@@ -1131,6 +1131,11 @@ def mechanism_labels(
             time_column_id=plan.time_column_id or "",
         )
         if plan.mechanism is TaskMechanism.ENTITY_FUTURE_EVENT_EXISTENCE:
+            semantics = int(round(plan.parameter_map.get("program_semantics_code", 1.0)))
+            if semantics in {2, 3, 4, 5}:
+                return _program_entity_values(
+                    schema, database, plan, semantics,
+                )
             return _future_existence_values(
                 schema, database, candidate,
                 int(plan.cutoff_time), int(plan.horizon_end_time),
@@ -1211,6 +1216,58 @@ def _future_existence_values(
     labels = np.zeros(database.table(candidate.entity_table_id).row_count, dtype=np.int8)
     labels[np.unique(assignments[selected])] = 1
     return labels
+
+
+def _program_entity_values(
+    schema: PhysicalSchema,
+    database: DatabaseInstance,
+    plan: TaskPlan,
+    semantics: int,
+) -> np.ndarray:
+    """Replay entity-level labels emitted by a pre-sampled TaskProgram.
+
+    The numeric semantic code keeps TaskPlan.parameters backwards-compatible
+    (that field intentionally accepts numeric values only); the full
+    serialisable expression remains in task_program.json.
+    """
+    if plan.foreign_key_id is None or plan.time_column_id is None:
+        raise ValueError("program labels require FK and time column")
+    fk = _foreign_key(schema, plan.foreign_key_id)
+    event = database.table(plan.source_table_id)
+    assignments = event.column(fk.child_column_id).astype(np.int64)
+    times = event.column(plan.time_column_id).astype(np.int64)
+    entity_count = database.table(plan.target_table_id).row_count
+    selected = (
+        (assignments >= 0)
+        & (times > int(plan.cutoff_time))
+        & (times <= int(plan.horizon_end_time))
+    )
+    if semantics == 2:
+        column_id = plan.source_column_id
+        if column_id is None:
+            return _future_existence_values(
+                schema, database,
+                FutureEventCandidate(
+                    foreign_key_id=plan.foreign_key_id,
+                    entity_table_id=plan.target_table_id,
+                    event_table_id=plan.source_table_id,
+                    time_column_id=plan.time_column_id,
+                ),
+                int(plan.cutoff_time), int(plan.horizon_end_time),
+            )
+        values = _numeric(event.column(column_id))
+        selected &= values > float(plan.parameter_map.get("program_threshold", 0.0))
+    labels = np.zeros(entity_count, dtype=np.int8)
+    if semantics in {2, 4}:
+        if np.any(selected):
+            labels[np.unique(assignments[selected])] = 1
+        return labels
+    counts = (
+        np.bincount(assignments[selected], minlength=entity_count)
+        if np.any(selected) else np.zeros(entity_count, dtype=np.int64)
+    )
+    threshold = float(plan.parameter_map.get("program_threshold", 1.0))
+    return (counts > threshold).astype(np.int8)
 
 
 def _history_gated_values(

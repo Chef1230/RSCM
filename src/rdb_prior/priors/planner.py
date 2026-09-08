@@ -973,7 +973,16 @@ class PriorPlanner:
             ),
             process_mechanism=mechanism_ref(process),
             shared_state_ids=(shared_state_id,),
-            compatible_task_families=("entity_future_event_existence",),
+            compatible_task_families=(
+                "future_event_existence",
+                "entity_future_event_existence",
+                "history_gated_future_active",
+                "history_gated_future_inactive",
+                "future_event_attribute",
+                "temporal_aggregate",
+                "interaction_response",
+                "multi_hop_program",
+            ),
             parameters=parameters,
         )
 
