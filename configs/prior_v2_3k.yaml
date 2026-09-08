@@ -1,0 +1,395 @@
+# 3,000-database v2 prior batch.  Per-database populations stay bounded so
+# this is a practical generation run rather than the two-database smoke test.
+# Relative output paths are resolved from the 02_syn_data project directory.
+config_version: 1
+seed: 42
+
+paths:
+  # Stage outputs are derived as schema/, instance/, task/, and rdbpfn/.
+  output_root: outputs/prior_v2_3k
+
+generation:
+  # Stage 01: 3,000 schemas, then Stage 02 consumes all of them.
+  num_schemas: 3000
+  start_index: 0
+  sample_id_prefix: sample
+  progress_every: 1
+  overwrite: false
+  project_version: schema-pipeline-v1
+
+# Stage-01 diagnostic graph artifacts. DOT is dependency-free; set
+# render_format to png, svg, or pdf when Graphviz `dot` is installed.
+schema_graph:
+  write_dot: false
+  render_format: null
+  graphviz_command: dot
+  include_columns: true
+  include_role_metadata: true
+
+schema:
+  blueprint_id_prefix: blueprint
+  min_tables: 3
+  max_tables: 15
+
+  # Same table-count prior used by the original config_6 preset.
+  table_count_values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  table_count_weights: [0.20, 0.12, 0.16, 0.14, 0.12, 0.10, 0.06, 0.03, 0.02, 0.02, 0.015, 0.005, 0.01]
+
+  # All FK edges must satisfy parent.rank < child.rank.
+  max_rank: 3
+
+  # Extra edges are sampled only from globally legal role/rank pairs.
+  # max_extra_edges is the budget at max_tables; smaller schemas receive a
+  # proportional share, so the edge count grows with the table count.
+  max_extra_edges: 2
+  extra_edge_probability: 0.35
+
+  # Keep structural motifs local; remaining tables use legal role-aware
+  # background attachments so the entire schema is not task-shaped.
+  min_motif_occurrences: 1
+  max_motif_occurrences: 5
+  background_attachment_probability: 0.35
+
+motifs:
+  # Full config_6 motif vocabulary; prior-family fallback handles schemas that
+  # do not contain an eligible single-parent Entity -> Event occurrence.
+  weights:
+    entity_event: 1.00
+    entity_event_detail: 1.25
+    entity_bridge_collider: 1.00
+    entity_event_collider: 1.00
+    entity_event_fork: 1.00
+    event_reference_chain: 0.80
+    lookup_assignment: 0.90
+
+physical_design:
+  schema_id_prefix: schema
+
+  # Fallback is not used while the four table-count tiers below cover 3..15.
+  min_feature_columns: 2
+  max_feature_columns: 6
+  feature_nullable_probability: 0.35
+  primary_key_names: [id, pk_id, row_id]
+
+  # Legacy syn_data size-aware column prior. Ranges must not overlap.
+  feature_columns_by_table_count:
+    - table_count_min: 3
+      table_count_max: 5
+      min_columns: 6
+      max_columns: 15
+    - table_count_min: 6
+      table_count_max: 8
+      min_columns: 4
+      max_columns: 10
+    - table_count_min: 9
+      table_count_max: 12
+      min_columns: 3
+      max_columns: 8
+    - table_count_min: 13
+      table_count_max: 15
+      min_columns: 2
+      max_columns: 6
+
+  # Keep this null: role overrides would shadow the size-aware tiers above.
+  feature_columns_by_role: null
+
+# Stage 02: bind every physical schema to an executable instance plan.
+instance:
+  entity_rows_min: 48
+  entity_rows_max: 48
+  entity_rows_distribution: loguniform
+  entity_rows_median: 256
+  entity_rows_log_sigma: 0.8
+  lookup_rows_min: 4
+  lookup_rows_max: 4
+  lookup_rows_distribution: uniform
+  event_fanout_min: 0.75
+  event_fanout_max: 4.0
+  bridge_rows_factor_min: 0.5
+  bridge_rows_factor_max: 2.0
+  detail_fanout_min: 0.75
+  detail_fanout_max: 4.0
+  entity_child_factor_min: 0.5
+  entity_child_factor_max: 1.5
+
+  # Global per-database size multiplier. uniform keeps sizes tightly clustered
+  # around the base row counts; lognormal adds heavy inter-database variance.
+  population_scale_distribution: uniform
+  population_scale_log_sigma: 0.8
+
+  max_rows_per_table: 256
+
+  # One shared latent registry drives both FK choice and feature SCMs.
+  latent_dimension: 4
+  optional_rate_min: 0.05
+  optional_rate_max: 0.25
+  affinity_strength: 1.0
+  degree_strength: 0.8
+
+  scm_weights:
+    exogenous: 0.30
+    linear: 0.40
+    cam: 0.20
+    mlp: 0.10
+  root_cause_weights:
+    standard_normal: 0.30
+    linear: 0.20
+    nonlinear: 0.20
+    lognormal: 0.15
+    gaussian_mixture: 0.15
+
+  # Role-conditioned overrides; omitted fields inherit the global prior.
+  role_scm:
+    entity:
+      scm_weights:
+        exogenous: 0.15
+        linear: 0.50
+        cam: 0.25
+        mlp: 0.10
+      root_cause_weights:
+        standard_normal: 0.25
+        linear: 0.30
+        nonlinear: 0.20
+        lognormal: 0.10
+        gaussian_mixture: 0.15
+      signal_scale_multiplier: 1.00
+      noise_scale_multiplier: 0.90
+      activation_scale_multiplier: 1.00
+      output_scale_multiplier: 1.00
+    event:
+      scm_weights:
+        exogenous: 0.10
+        linear: 0.30
+        cam: 0.35
+        mlp: 0.25
+      root_cause_weights:
+        standard_normal: 0.15
+        linear: 0.15
+        nonlinear: 0.30
+        lognormal: 0.25
+        gaussian_mixture: 0.15
+      signal_scale_multiplier: 1.15
+      noise_scale_multiplier: 1.20
+      activation_scale_multiplier: 1.10
+      output_scale_multiplier: 1.00
+    lookup:
+      scm_weights:
+        exogenous: 1.00
+      root_cause_weights:
+        standard_normal: 1.00
+      signal_scale_multiplier: 0.60
+      noise_scale_multiplier: 0.70
+      activation_scale_multiplier: 0.75
+      output_scale_multiplier: 0.80
+    bridge:
+      scm_weights:
+        exogenous: 0.10
+        linear: 0.45
+        cam: 0.30
+        mlp: 0.15
+      root_cause_weights:
+        standard_normal: 0.20
+        linear: 0.30
+        nonlinear: 0.25
+        lognormal: 0.10
+        gaussian_mixture: 0.15
+      signal_scale_multiplier: 1.10
+      noise_scale_multiplier: 0.85
+      activation_scale_multiplier: 1.00
+      output_scale_multiplier: 1.00
+    detail:
+      scm_weights:
+        exogenous: 0.15
+        linear: 0.50
+        cam: 0.25
+        mlp: 0.10
+      root_cause_weights:
+        standard_normal: 0.25
+        linear: 0.30
+        nonlinear: 0.20
+        lognormal: 0.15
+        gaussian_mixture: 0.10
+      signal_scale_multiplier: 1.00
+      noise_scale_multiplier: 0.95
+      activation_scale_multiplier: 0.95
+      output_scale_multiplier: 1.00
+
+  feature_missing_rate_min: 0.02
+  feature_missing_rate_max: 0.15
+  # Zero-inflated missingness: no fully-complete-column spike for v1.
+  feature_missing_zero_probability: 0.0
+  feature_missing_beta_alpha: 1.0
+  feature_missing_beta_beta: 1.0
+  # RDB-PFN-style hierarchical SCM prior. A database first samples meta
+  # hyperparameters; its tables then sample conditional scale/noise values.
+  feature_noise_scale_min: 0.0001
+  feature_noise_scale_max: 0.3
+  scm_signal_scale_min: 0.01
+  scm_signal_scale_max: 10.0
+  scm_meta_relative_std_min: 0.01
+  scm_meta_relative_std_max: 1.0
+  scm_activation_scale_min: 0.1
+  scm_activation_scale_max: 100.0
+  scm_output_scale_log_std: 1.4
+  scm_long_tail_probability: 0.5
+  scm_long_tail_alpha_min: 1.1
+  scm_long_tail_alpha_max: 2.0
+  categorical_cardinality_min: 3
+  categorical_cardinality_max: 12
+  # Keep the high-cardinality tail disabled for this 3k batch.
+  categorical_high_cardinality_probability: 0.0
+  categorical_high_cardinality_min: 13
+  categorical_high_cardinality_max: 256
+  time_scale_seconds_min: 300.0
+  time_scale_seconds_max: 86400.0
+
+instance_generation:
+  # null means consume all schema-manifest entries after start_index.
+  count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  # Process workers; one worker owns one database generation job.
+  num_workers: 8
+  progress_every: 25
+  overwrite: false
+  project_version: instance-pipeline-v1
+
+# Stage 03: derive supervised tasks without mutating the frozen database.
+task:
+  # Exact task count requested for every selected database.
+  tasks_per_database: 2
+  mechanism_weights:
+    relation_attribute: 0.35
+    entity_future_event_existence: 0.25
+    history_gated_future_inactive: 0.08
+    history_gated_future_active: 0.07
+    future_event_attribute_condition: 0.20
+    temporal_relational_aggregate: 0.20
+
+  support_fraction: 0.70
+  min_support_rows: 8
+  min_query_rows: 4
+  min_class_count_per_split: 1
+  max_classification_categories: 12
+
+  # Future labels use events in (cutoff, cutoff + horizon].
+  cutoff_quantile_min: 0.45
+  cutoff_quantile_max: 0.70
+  horizon_fraction_min: 0.12
+  horizon_fraction_max: 0.30
+  positive_rate_min: 0.20
+  positive_rate_max: 0.80
+  max_attempts_per_database: 128
+  require_full_task_count: true
+
+task_generation:
+  # null means consume all instance-manifest entries after start_index.
+  database_count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  num_workers: 8
+  progress_every: 25
+  overwrite: false
+  project_version: task-pipeline-v1
+
+rdbpfn_export:
+  # One dbinfer_bench dataset is emitted per task to preserve its own view.
+  task_count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  validation_fraction: 0.20
+  min_validation_rows: 8
+  compress: true
+  progress_every: 25
+  overwrite: false
+  project_version: rdbpfn-export-v1
+  # Build H5 from DFS-processed task features after DBB export.
+  h5_enabled: true
+  # null writes rdbpfn_tasks.h5 under paths.output_root/rdbpfn.
+  h5_output: null
+  rdbpfn_preprocessing_root: ../RDBPFN/data_preprocessing
+  h5_run_dfs: true
+  dfs_depth: 1
+  # Number of DBB datasets processed concurrently by the RDBPFN DFS script.
+  dfs_jobs: 4
+  h5_total_rows: 600
+  h5_max_columns: 60
+  h5_seed: 42
+
+# v2 prior layer.  Temporal/rule families pre-sample compatible TaskPrograms;
+# other sampled families retain the legacy task-planner fallback.
+prior:
+  mode: compositional
+
+  database_family_weights:
+    legacy_role_scm: 0.10
+    relational_scm: 0.30
+    relational_tree: 0.20
+    temporal_event: 0.25
+    rule_process: 0.15
+
+  shared_state:
+    family: gaussian_mixture
+    dimension: 4
+
+  temporal_state:
+    enabled: true
+    state_space:
+      values: [active, inactive, under_review, blocked]
+      terminal_states: [blocked]
+    initial_state:
+      family: state_conditioned_softmax
+    transition:
+      clock: hybrid
+      family: state_conditioned_softmax
+    duration:
+      family: exponential
+      state_conditioned: true
+    visibility:
+      family: hidden
+
+  task_policy:
+    require_family_compatibility: true
+    sample_program_before_data: true
+    posthoc_horizon_selection: false
+    programs_per_database: 1
+    max_materialization_attempts: 8
+    cutoff_fraction_min: 0.25
+    cutoff_fraction_max: 0.25
+    horizon_fraction_min: 0.60
+    horizon_fraction_max: 0.60
+    positive_rate_min: 0.01
+    positive_rate_max: 0.99
+
+  relational_scm:
+    column_dag_depth: [1, 4]
+    parent_count: [1, 5]
+    mechanisms:
+      exogenous: 0.10
+      linear: 0.35
+      cam: 0.35
+      mlp: 0.20
+    relation_mechanisms:
+      scm_logistic_propensity: 0.40
+      scm_softmax_affinity: 0.30
+      scm_cpt: 0.15
+      scm_community: 0.15
+    population_mechanisms:
+      poisson: 0.20
+      negative_binomial: 0.70
+      zero_inflated_negative_binomial: 0.10
+
+  nuisance:
+    enabled: false
+    kind: legacy
+
+debug:
+  # Set true for tests/research that need full hidden trajectories.
+  persist_private_state_trajectory: false
+
+# Connectivity, FK DAG, no self-loop, no parallel FK, role legality,
+# Entity/Event presence, Bridge parent count and rank order are hard schema
+# invariants. They intentionally are not configurable switches.
