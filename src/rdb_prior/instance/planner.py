@@ -639,7 +639,7 @@ class InstancePlanner:
             return plan
         if prior_plan.semantic_schema.schema_id != schema.schema_id:
             raise ValueError("prior plan does not belong to physical schema")
-        if prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+        if prior_plan.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
             return bind_temporal_event_plan(schema, plan, prior_plan)
         if prior_plan.family is PriorFamily.RELATIONAL_SCM:
             return bind_relational_scm_plan(schema, plan, prior_plan)

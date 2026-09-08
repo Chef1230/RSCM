@@ -14,6 +14,7 @@ from rdb_prior.instance.plan import InstancePlan
 _Finalizer = Callable[[PhysicalSchema, InstancePlan, DatabaseInstance], InstancePlan]
 _FINALIZERS: dict[str, _Finalizer] = {
     "temporal_event": resolve_state_conditioned_populations,
+    "rule_process": resolve_state_conditioned_populations,
     "relational_scm": resolve_relational_scm_population,
 }
 

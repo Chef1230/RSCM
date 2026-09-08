@@ -368,7 +368,7 @@ class TaskProgramPlanner:
         runtime: RuntimeContext,
     ) -> tuple[TaskProgramPlan, ...]:
         policy = prior_plan.task_policy
-        if prior_plan.family is not PriorFamily.TEMPORAL_EVENT:
+        if prior_plan.family not in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
             return ()
         if not policy.sample_program_before_data:
             return ()
@@ -381,7 +381,7 @@ class TaskProgramPlanner:
             raise ValueError("pre-data task programs require a calendar")
         temporal_bundles = [
             bundle for bundle in prior_plan.motif_bundles
-            if bundle.family is PriorFamily.TEMPORAL_EVENT
+            if bundle.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}
         ]
         if not temporal_bundles:
             raise ValueError("temporal prior has no motif bundle")

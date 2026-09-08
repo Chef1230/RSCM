@@ -856,14 +856,11 @@ class PriorCompositionPlan:
 
     @property
     def primary_family(self) -> PriorFamily:
-        return (
-            PriorFamily.TEMPORAL_EVENT
-            if any(
-                item.family is PriorFamily.TEMPORAL_EVENT
-                for item in self.motif_bundles
-            )
-            else PriorFamily.LEGACY_ROLE_SCM
-        )
+        if any(item.family is PriorFamily.RULE_PROCESS for item in self.motif_bundles):
+            return PriorFamily.RULE_PROCESS
+        if any(item.family is PriorFamily.TEMPORAL_EVENT for item in self.motif_bundles):
+            return PriorFamily.TEMPORAL_EVENT
+        return PriorFamily.LEGACY_ROLE_SCM
 
     def to_dict(self) -> dict[str, Any]:
         return {

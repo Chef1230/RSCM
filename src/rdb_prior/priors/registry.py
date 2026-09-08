@@ -19,7 +19,7 @@ _DESCRIPTORS = {
     PriorFamily.TEMPORAL_EVENT: PriorFamilyDescriptor(family=PriorFamily.TEMPORAL_EVENT, version="v1", implemented=True),
     PriorFamily.RELATIONAL_SCM: PriorFamilyDescriptor(family=PriorFamily.RELATIONAL_SCM, version="v1", implemented=True),
     PriorFamily.RELATIONAL_TREE: PriorFamilyDescriptor(family=PriorFamily.RELATIONAL_TREE, version="v1", implemented=True),
-    PriorFamily.RULE_PROCESS: PriorFamilyDescriptor(family=PriorFamily.RULE_PROCESS, version="reserved", implemented=False),
+    PriorFamily.RULE_PROCESS: PriorFamilyDescriptor(family=PriorFamily.RULE_PROCESS, version="v1", implemented=True),
 }
 
 

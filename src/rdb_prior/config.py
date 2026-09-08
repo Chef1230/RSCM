@@ -42,6 +42,7 @@ from rdb_prior.priors.planner import (
     TemporalStateConfig,
 )
 from rdb_prior.nuisance.planner import NuisanceOverlayConfig
+from rdb_prior.process.sampler import RuleProcessConfig
 from rdb_prior.routing.config import (
     RoutedH5Config,
     RouterModelConfig,
@@ -637,6 +638,7 @@ _PRIOR_OPTIONS = {
     "temporal_state",
     "relational_tree",
     "relational_scm",
+    "rule_process",
     "nuisance",
 }
 
@@ -674,6 +676,15 @@ _PRIOR_NUISANCE_OPTIONS = {
     "spurious_strength",
     "distractor_relation_count",
     "distractor_strength",
+}
+
+_PRIOR_RULE_PROCESS_OPTIONS = {
+    "enabled",
+    "condition_probability",
+    "intensity_multiplier_min",
+    "intensity_multiplier_max",
+    "attribute_offset_min",
+    "attribute_offset_max",
 }
 
 _PRIOR_RELATIONAL_SCM_OPTIONS = {
@@ -1496,6 +1507,9 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
         relational_scm=_relational_scm_config(
             _mapping(raw.get("relational_scm", {}), "config.prior.relational_scm")
         ),
+        rule_process=_rule_process_config(
+            _mapping(raw.get("rule_process", {}), "config.prior.rule_process")
+        ),
         nuisance=_nuisance_config(
             _mapping(raw.get("nuisance", {}), "config.prior.nuisance")
         ),
@@ -1517,6 +1531,20 @@ def _shared_state_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "family": shared.get("family", "gaussian_mixture"),
         "dimension": shared.get("dimension", raw.get("state_dimension", 4)),
     }
+
+
+def _rule_process_config(raw: Mapping[str, Any]) -> RuleProcessConfig:
+    _reject_unknown(raw, _PRIOR_RULE_PROCESS_OPTIONS, "config.prior.rule_process")
+    defaults = RuleProcessConfig()
+    try:
+        return RuleProcessConfig(
+            **{
+                name: raw.get(name, getattr(defaults, name))
+                for name in defaults.__dataclass_fields__
+            }
+        )
+    except (TypeError, ValueError) as error:
+        raise SchemaConfigError(f"Invalid config.prior.rule_process: {error}") from error
 
 
 def _nuisance_config(raw: Mapping[str, Any]) -> NuisanceOverlayConfig:

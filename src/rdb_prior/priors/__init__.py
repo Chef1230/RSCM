@@ -22,6 +22,7 @@ from rdb_prior.priors.model import (
     TransitionMechanismPlan,
 )
 from rdb_prior.nuisance.planner import NuisanceOverlayConfig, NuisancePlanner
+from rdb_prior.process.sampler import RuleProcessConfig
 from rdb_prior.priors.planner import (
     PriorPlanner,
     PriorPlannerConfig,
@@ -55,6 +56,7 @@ __all__ = [
     "TemporalStateConfig",
     "RelationSCMConfig",
     "RelationTreeConfig",
+    "RuleProcessConfig",
     "PriorPlannerConfig",
     "PriorPlanner",
 ]

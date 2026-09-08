@@ -13,6 +13,8 @@ from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.generation.state import SharedStateRegistry
 from rdb_prior.generation.trees.executor import evaluate_forest
 from rdb_prior.generation.trees.model import ForestPlan
+from rdb_prior.process.executor import RuleEvaluationContext, RuleEffect, RuleProcessExecutor
+from rdb_prior.process.model import RulePlan
 from rdb_prior.generation.state_trajectory import (
     StateTrajectory,
     TemporalStateRegistry,
@@ -40,7 +42,7 @@ def resolve_temporal_population_plan(
     """
     if plan.temporal_state_plans:
         return _resolve_stateful_temporal_population_plan(schema, plan, entity_database)
-    if plan.prior_family != "temporal_event" or not plan.population_mechanisms:
+    if plan.prior_family not in {"temporal_event", "rule_process"} or not plan.population_mechanisms:
         return plan
     shared_states = SharedStateRegistry.from_plan(plan)
     table_plans = {item.table_id: item for item in plan.tables}
@@ -88,10 +90,20 @@ def resolve_temporal_population_plan(
         else:
             score = 0.60 * z_score + 0.40 * x_score
         baseline = float(parameters["baseline_intensity"])
+        intensity = baseline * np.exp(0.55 * _standardize(score))
+        rule_effect = _rule_effect_for_entities(
+            parameters.get("rule_plan"),
+            entity_database,
+            mechanism.state_ids[0],
+            state,
+            row_count,
+        )
+        if rule_effect is not None:
+            intensity = intensity * rule_effect.intensity_multiplier + rule_effect.intensity_addition
         intensity = np.clip(
-            baseline * np.exp(0.55 * _standardize(score)),
+            intensity,
             0.03,
-            max(12.0, baseline * 6.0),
+            max(12.0, baseline * 6.0 * (float(np.max(rule_effect.intensity_multiplier)) if rule_effect is not None else 1.0)),
         )
         dispersion = float(parameters["dispersion"])
         probability = dispersion / (dispersion + intensity)
@@ -165,7 +177,7 @@ def _apply_stateless_temporal_event_processes(
     database: DatabaseInstance,
 ) -> DatabaseInstance:
     """Replace P1 Event FK/time/feature values with one shared process."""
-    if plan.prior_family != "temporal_event" or not plan.population_mechanisms:
+    if plan.prior_family not in {"temporal_event", "rule_process"} or not plan.population_mechanisms:
         return database
     shared_states = SharedStateRegistry.from_plan(plan)
     tables = {item.table_id: item for item in database.tables}
@@ -212,6 +224,7 @@ def _apply_stateless_temporal_event_processes(
                     assignments,
                     entity_state,
                     entity_table,
+                    event,
                     process,
                     columns_by_id,
                     rng,
@@ -227,6 +240,7 @@ def _event_values(
     assignments: np.ndarray,
     entity_state: np.ndarray,
     entity_table: TableData,
+    event_data: TableData | None,
     process,
     column_mechanisms: dict[str, ColumnMechanismPlan],
     rng: np.random.Generator,
@@ -254,6 +268,31 @@ def _event_values(
     time_score = (times - start) / max(end - start, 1)
     table_plan = plan.table(event_table.table_id)
     state = entity_state[assignments]
+    rule_effect = None
+    rule_payload = parameters.get("rule_plan")
+    if isinstance(rule_payload, Mapping):
+        state_id = next(iter(process.state_ids), None)
+        if state_id is not None:
+            time_ids = {
+                event_table.table_id: next(
+                    (column.column_id for column in event_table.columns if column.kind is ColumnKind.TIME),
+                    "",
+                )
+            }
+            rule_context = RuleEvaluationContext(
+                tables={
+                    entity_table.table_id: entity_table,
+                    **({event_data.table_id: event_data} if event_data is not None else {}),
+                },
+                states={state_id: entity_state},
+                cutoff_time=end,
+                time_column_ids=time_ids,
+            )
+            rule_effect = RuleProcessExecutor().effects(
+                RulePlan.from_dict(rule_payload),
+                rule_context,
+                row_count=len(entity_state),
+            )
     for column in event_table.columns:
         if column.kind is not ColumnKind.FEATURE:
             continue
@@ -267,6 +306,8 @@ def _event_values(
             history,
             rng,
         )
+        if rule_effect is not None:
+            score = score + rule_effect.attribute_offset[assignments]
         output[column.column_id] = encode_feature_score(
             score,
             column,
@@ -320,6 +361,23 @@ def _tree_intensity_score(
         },
         row_count=state.shape[0],
     )
+
+
+def _rule_effect_for_entities(
+    payload: object,
+    database: DatabaseInstance,
+    state_id: str,
+    state: np.ndarray,
+    row_count: int,
+) -> RuleEffect | None:
+    if not isinstance(payload, Mapping):
+        return None
+    rule = RulePlan.from_dict(payload)
+    context = RuleEvaluationContext(
+        tables={table.table_id: table for table in database.tables},
+        states={state_id: state},
+    )
+    return RuleProcessExecutor().effects(rule, context, row_count=row_count)
 
 
 def _numeric_column(values: np.ndarray) -> np.ndarray:
@@ -563,7 +621,7 @@ def _apply_stateful_temporal_event_processes(
     plan: InstancePlan,
     database: DatabaseInstance,
 ) -> TemporalEventMaterialization:
-    if plan.prior_family != "temporal_event":
+    if plan.prior_family not in {"temporal_event", "rule_process"}:
         return TemporalEventMaterialization(database=database)
     tables = {item.table_id: item for item in database.tables}
     processes = {item.table_id: item for item in plan.temporal_processes}
@@ -666,6 +724,13 @@ def _stateful_event_schedule(
         )
     else:
         intensity_score = np.zeros(entity.row_count, dtype=np.float64)
+    rule_effect = _rule_effect_for_entities(
+        mechanism_parameters.get("rule_plan"),
+        database,
+        temporal_plan.shared_state_id,
+        static,
+        entity.row_count,
+    )
 
     assignments: list[int] = []
     times: list[int] = []
@@ -704,7 +769,17 @@ def _stateful_event_schedule(
                 z,
                 float(attribute_score[entity_index]),
                 base_rate
-                * float(np.exp(0.55 * np.clip(intensity_score[entity_index], -5.0, 5.0))),
+                * float(np.exp(0.55 * np.clip(intensity_score[entity_index], -5.0, 5.0)))
+                * (
+                    float(rule_effect.intensity_multiplier[entity_index])
+                    if rule_effect is not None
+                    else 1.0
+                )
+                + (
+                    float(rule_effect.intensity_addition[entity_index])
+                    if rule_effect is not None
+                    else 0.0
+                ),
             )
             event_time = now + _stateful_wait(
                 entity_rng,
@@ -737,6 +812,10 @@ def _stateful_event_schedule(
                     entity_history,
                 )
                 target = _next_state(temporal_plan, state, z, entity_rng)
+                if rule_effect is not None:
+                    override = rule_effect.state_overrides[entity_index]
+                    if override in state_to_index:
+                        target = str(override)
                 trajectory.transition(
                     timestamp=timestamp,
                     ordinal=ordinal,
@@ -775,6 +854,10 @@ def _stateful_event_schedule(
                 )
                 if clock is TransitionClock.HYBRID:
                     target = _next_state(temporal_plan, state, z, entity_rng)
+                    if rule_effect is not None:
+                        override = rule_effect.state_overrides[entity_index]
+                        if override in state_to_index:
+                            target = str(override)
                     trajectory.transition(
                         timestamp=timestamp,
                         ordinal=ordinal,
@@ -794,6 +877,10 @@ def _stateful_event_schedule(
                 last_transition,
             )
             target = _next_state(temporal_plan, state, z, entity_rng)
+            if rule_effect is not None:
+                override = rule_effect.state_overrides[entity_index]
+                if override in state_to_index:
+                    target = str(override)
             trajectory.transition(
                 timestamp=timestamp,
                 ordinal=ordinal,
@@ -1047,6 +1134,19 @@ def _stateful_event_values(
         item for item in table.columns if item.kind is ColumnKind.FEATURE
     ]
     emission_column_id = feature_columns[0].column_id if feature_columns else None
+    rule_effect = None
+    rule_payload = dict(mechanism.parameters).get("rule_plan")
+    if isinstance(rule_payload, Mapping):
+        owner_state = SharedStateRegistry.from_plan(plan).state(temporal_plan.shared_state_id)
+        row_count = len(next(iter(entity_table.columns.values())))
+        rule_effect = RuleProcessExecutor().effects(
+            RulePlan.from_dict(rule_payload),
+            RuleEvaluationContext(
+                tables={entity_table.table_id: entity_table},
+                states={temporal_plan.shared_state_id: owner_state},
+            ),
+            row_count=row_count,
+        )
     output: dict[str, np.ndarray] = {}
     for column in table.columns:
         if column.kind is ColumnKind.TIME:
@@ -1063,6 +1163,8 @@ def _stateful_event_values(
             history,
             rng,
         )
+        if rule_effect is not None:
+            score = score + rule_effect.attribute_offset[schedule.assignments]
         if column.column_id == emission_column_id and (
             temporal_plan.visibility is StateVisibility.EVENT_EMISSION
         ):

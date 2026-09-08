@@ -42,8 +42,8 @@ def bind_temporal_event_plan(
     preserve its integrity guarantees.  The subsequent database generator
     reuses the same seeds to materialize times and event attributes.
     """
-    if prior_plan.family is not PriorFamily.TEMPORAL_EVENT:
-        raise ValueError("temporal binder requires temporal_event prior")
+    if prior_plan.family not in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
+        raise ValueError("temporal binder requires temporal_event or rule_process prior")
     state_plan = replace(
         plan,
         shared_state_ids=tuple(item.state_id for item in prior_plan.shared_states),
@@ -56,7 +56,7 @@ def bind_temporal_event_plan(
     column_mechanisms: list[ColumnMechanismPlan] = []
     relations = list(plan.relations)
     for bundle in prior_plan.motif_bundles:
-        if bundle.family is not PriorFamily.TEMPORAL_EVENT:
+        if bundle.family not in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
             continue
         if bundle.attribute_mechanism.kind not in {
             AttributePriorKind.COLUMN_SCM.value,
@@ -141,6 +141,9 @@ def bind_temporal_event_plan(
         )
         if isinstance(intensity_payload, Mapping):
             population_parameters += (("event_intensity_forest", dict(intensity_payload)),)
+        rule_payload = parameters.get("rule_plan")
+        if isinstance(rule_payload, Mapping):
+            population_parameters += (("rule_plan", dict(rule_payload)),)
         population_mechanisms.append(
             PopulationMechanismPlan(
                 table_id=event_id,
@@ -179,6 +182,11 @@ def bind_temporal_event_plan(
                         "state_renewal_scale_weights",
                         rng.normal(0.0, 0.35, size=entity_state.shape[1]).tolist(),
                     ),
+                )
+                + (
+                    (("rule_plan", dict(rule_payload)),)
+                    if isinstance(rule_payload, Mapping)
+                    else ()
                 ),
             )
         )

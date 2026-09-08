@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -33,6 +33,7 @@ from rdb_prior.priors.model import (
     TransitionMechanismPlan,
 )
 from rdb_prior.priors.registry import descriptor, is_implemented, mechanism_ref
+from rdb_prior.process.sampler import RuleProcessConfig, sample_rule_plan
 from rdb_prior.nuisance.planner import NuisanceOverlayConfig, NuisancePlanner
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.blueprint import SchemaBlueprint
@@ -236,6 +237,7 @@ class PriorPlannerConfig:
     composition: PriorCompositionConfig | None = None
     relational_scm: RelationSCMConfig = RelationSCMConfig()
     relational_tree: RelationTreeConfig = RelationTreeConfig()
+    rule_process: RuleProcessConfig = RuleProcessConfig()
     nuisance: NuisanceOverlayConfig = NuisanceOverlayConfig()
 
     def __post_init__(self) -> None:
@@ -264,6 +266,8 @@ class PriorPlannerConfig:
             raise TypeError("relational_scm must be RelationSCMConfig")
         if not isinstance(self.relational_tree, RelationTreeConfig):
             raise TypeError("relational_tree must be RelationTreeConfig")
+        if not isinstance(self.rule_process, RuleProcessConfig):
+            raise TypeError("rule_process must be RuleProcessConfig")
         if not isinstance(self.nuisance, NuisanceOverlayConfig):
             raise TypeError("nuisance must be NuisanceOverlayConfig")
         if (
@@ -278,7 +282,7 @@ class PriorPlannerConfig:
         ):
             raise ValueError("temporal state requires a non-static composition")
         if self.temporal_state.enabled and self.composition is None and not any(
-            family is PriorFamily.TEMPORAL_EVENT and weight > 0
+            family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS} and weight > 0
             for family, weight in self.database_family_weights
         ):
             raise ValueError(
@@ -328,7 +332,11 @@ class PriorPlanner:
                     )
                 )
             elif candidates:
-                family = PriorFamily.TEMPORAL_EVENT
+                family = (
+                    PriorFamily.RULE_PROCESS
+                    if components.process is ProcessPriorKind.RULE
+                    else PriorFamily.TEMPORAL_EVENT
+                )
             else:
                 raise ValueError(
                     "a non-static compositional temporal prior requires an entity-event motif"
@@ -341,7 +349,7 @@ class PriorPlanner:
         }
         for occurrence in blueprint.motif_occurrences:
             candidate = temporal_by_occurrence.get(occurrence.occurrence_id)
-            if family is PriorFamily.TEMPORAL_EVENT and candidate is not None:
+            if family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS} and candidate is not None:
                 state_id = f"state_{candidate.entity_table_id}_{occurrence.occurrence_id}"
                 states.append(
                     SharedStatePlan(
@@ -377,6 +385,7 @@ class PriorPlanner:
                         semantic_schema=semantic_schema,
                         physical_schema=physical_schema,
                         runtime=runtime,
+                        bundle_family=family,
                     )
                 )
                 continue
@@ -446,7 +455,7 @@ class PriorPlanner:
             for family, weight in self.config.database_family_weights
             if weight > 0
             and (
-                family is not PriorFamily.TEMPORAL_EVENT
+                family not in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}
                 or temporal_available
             )
         ]
@@ -464,7 +473,7 @@ class PriorPlanner:
         family: PriorFamily,
         runtime: RuntimeContext,
     ) -> PriorCompositionConfig:
-        if family is PriorFamily.TEMPORAL_EVENT:
+        if family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
             temporal = runtime.python_rng(
                 "prior", "temporal-component"
             ).choice(
@@ -479,6 +488,11 @@ class PriorPlanner:
                 attribute=AttributePriorKind.COLUMN_SCM,
                 relation=RelationPriorKind.STATE_CONDITIONED_EVENT,
                 temporal=temporal,
+                process=(
+                    ProcessPriorKind.RULE
+                    if family is PriorFamily.RULE_PROCESS
+                    else ProcessPriorKind.NONE
+                ),
                 nuisance=self.config.nuisance.kind,
             )
         if family is PriorFamily.RELATIONAL_TREE:
@@ -859,6 +873,7 @@ class PriorPlanner:
         semantic_schema: SemanticSchemaPlan,
         physical_schema: PhysicalSchema,
         runtime: RuntimeContext,
+        bundle_family: PriorFamily = PriorFamily.TEMPORAL_EVENT,
     ) -> MotifMechanismBundle:
         entity_role = semantic_schema.table_role(entity_table_id)
         event_role = semantic_schema.table_role(event_table_id)
@@ -933,6 +948,20 @@ class PriorPlanner:
             ("selection", components.temporal.value),
         )
         process = components.process
+        rule_plan = None
+        if process is ProcessPriorKind.RULE:
+            rule_plan = sample_rule_plan(
+                schema=physical_schema,
+                entity_table_id=entity_table_id,
+                event_table_id=event_table_id,
+                foreign_key_id=foreign_key_id,
+                runtime=runtime,
+                state_id=shared_state_id,
+                config=self.config.rule_process,
+            )
+            parameters += (("rule_plan", rule_plan.to_dict()),)
+            entity_mechanisms += ("rule_process",)
+            event_mechanisms += ("rule_process",)
         if temporal_state_id is not None:
             parameters += (("temporal_state_id", temporal_state_id),)
             entity_mechanisms += (temporal_state_id,)
@@ -943,7 +972,7 @@ class PriorPlanner:
         return MotifMechanismBundle(
             bundle_id=f"bundle_{occurrence_id}",
             motif_occurrence_id=occurrence_id,
-            family=PriorFamily.TEMPORAL_EVENT,
+            family=bundle_family,
             node_bindings=(
                 TableMechanismBinding(
                     table_id=entity_table_id,
@@ -971,7 +1000,14 @@ class PriorPlanner:
                 components.temporal,
                 parameters=temporal_parameters,
             ),
-            process_mechanism=mechanism_ref(process),
+            process_mechanism=mechanism_ref(
+                process,
+                parameters=(
+                    (("rule_id", rule_plan.rule_id), ("rule_plan", rule_plan.to_dict()))
+                    if rule_plan is not None
+                    else ()
+                ),
+            ),
             shared_state_ids=(shared_state_id,),
             compatible_task_families=(
                 "future_event_existence",

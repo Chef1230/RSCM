@@ -496,6 +496,7 @@ def generate_physical_schemas(
                 "implemented_families": [
                     PriorFamily.LEGACY_ROLE_SCM.value,
                     PriorFamily.TEMPORAL_EVENT.value,
+                    PriorFamily.RULE_PROCESS.value,
                 ],
             },
         )
@@ -761,7 +762,7 @@ def _generate_one_database_instance(
             runtime=runtime.child("prior"),
         )
     attempts = 1
-    if prior_plan is not None and prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+    if prior_plan is not None and prior_plan.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
         attempts = prior_plan.task_policy.max_materialization_attempts
 
     last_error: ValueError | None = None
@@ -777,7 +778,7 @@ def _generate_one_database_instance(
                 prior_plan=prior_plan,
             )
             task_programs = ()
-            if prior_plan is not None and prior_plan.family is PriorFamily.TEMPORAL_EVENT:
+            if prior_plan is not None and prior_plan.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
                 # Programs are sampled from the plan calendar before any rows are
                 # materialized.  They are never calibrated from realized labels.
                 task_programs = TaskProgramPlanner().plan(

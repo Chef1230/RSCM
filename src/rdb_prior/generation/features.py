@@ -92,7 +92,7 @@ def generate_table_features(
         elif (
             mechanism is not None
             and mechanism.family == "tree"
-            and plan.prior_family != "temporal_event"
+            and plan.prior_family not in {"temporal_event", "rule_process"}
         ):
             signal = _tree_feature_signal(
                 mechanism=mechanism,
