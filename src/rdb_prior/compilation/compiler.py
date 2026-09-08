@@ -20,6 +20,11 @@ from rdb_prior.compilation.model import (
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.blueprint import SchemaBlueprint
 from rdb_prior.schema.roles import get_role_edge_rule
+from rdb_prior.schema.semantics import (
+    ColumnSemanticRole,
+    SemanticNodePlan,
+    SemanticSchemaPlan,
+)
 from rdb_prior.schema.spec import Optionality, TableRole
 from rdb_prior.schema.validation import validate_blueprint
 
@@ -206,6 +211,8 @@ class PhysicalSchemaCompiler:
         blueprint: SchemaBlueprint,
         sample_id: str | int,
         runtime: RuntimeContext,
+        *,
+        semantic_schema: SemanticSchemaPlan | None = None,
     ) -> PhysicalSchema:
         if not isinstance(blueprint, SchemaBlueprint):
             raise TypeError("blueprint must be SchemaBlueprint")
@@ -220,6 +227,8 @@ class PhysicalSchemaCompiler:
             raise TypeError("runtime must be RuntimeContext")
 
         validate_blueprint(blueprint, raise_on_error=True)
+        if semantic_schema is not None:
+            self._validate_semantic_schema(blueprint, semantic_schema)
         table_names = self._table_names(blueprint, runtime)
         primary_key_names = self._primary_key_names(blueprint, runtime)
         incoming_edges = {
@@ -266,11 +275,17 @@ class PhysicalSchemaCompiler:
                     )
                 )
 
+            semantic_node = (
+                semantic_schema.node_plan(node.node_id)
+                if semantic_schema is not None
+                else None
+            )
             self._add_role_columns(
                 node_id=node.node_id,
                 role=node.role,
                 columns=columns,
                 runtime=runtime,
+                semantic_node=semantic_node,
             )
             self._add_feature_columns(
                 node_id=node.node_id,
@@ -325,9 +340,16 @@ class PhysicalSchemaCompiler:
         blueprint: SchemaBlueprint,
         sample_id: str | int,
         runtime: RuntimeContext,
+        *,
+        semantic_schema: SemanticSchemaPlan | None = None,
     ) -> CompilationResult:
         """Compile with an explicit logical-to-physical trace."""
-        schema = self.compile(blueprint, sample_id, runtime)
+        schema = self.compile(
+            blueprint,
+            sample_id,
+            runtime,
+            semantic_schema=semantic_schema,
+        )
         trace = CompilationTrace(
             blueprint_id=blueprint.blueprint_id,
             schema_id=schema.schema_id,
@@ -383,6 +405,7 @@ class PhysicalSchemaCompiler:
         role: TableRole,
         columns: list[PhysicalColumn],
         runtime: RuntimeContext,
+        semantic_node: SemanticNodePlan | None = None,
     ) -> None:
         specifications: tuple[
             tuple[PhysicalDataType, ColumnKind, bool, bool], ...
@@ -454,6 +477,76 @@ class PhysicalSchemaCompiler:
                 )
             )
             existing_names.add(name)
+
+        if semantic_node is None:
+            return
+        for semantic_role in (
+            semantic_node.required_column_roles
+            + semantic_node.optional_column_roles
+        ):
+            if semantic_role is ColumnSemanticRole.TIMESTAMP and any(
+                column.kind is ColumnKind.TIME for column in columns
+            ):
+                continue
+            data_type = self._semantic_data_type(semantic_role)
+            ordinal = len(columns)
+            token = runtime.uint32_seed(
+                "schema",
+                "semantic",
+                "column",
+                node_id,
+                semantic_role.value,
+                ordinal,
+            ) & 0xFFFF
+            name = f"c_{ordinal:03d}_{token:04x}"
+            if name in existing_names:
+                raise RuntimeError("anonymous semantic-column name collision")
+            columns.append(
+                PhysicalColumn(
+                    column_id=f"{node_id}_C{ordinal:03d}",
+                    name=name,
+                    data_type=data_type,
+                    kind=ColumnKind.FEATURE,
+                    ordinal=ordinal,
+                    nullable=False,
+                    unique=False,
+                )
+            )
+            existing_names.add(name)
+
+    @staticmethod
+    def _semantic_data_type(role: ColumnSemanticRole) -> PhysicalDataType:
+        if role in {
+            ColumnSemanticRole.STATIC_ATTRIBUTE,
+            ColumnSemanticRole.MEASUREMENT,
+            ColumnSemanticRole.AMOUNT,
+        }:
+            return PhysicalDataType.DOUBLE
+        if role is ColumnSemanticRole.STATE or role is ColumnSemanticRole.OUTCOME:
+            return PhysicalDataType.BOOLEAN
+        if role in {
+            ColumnSemanticRole.CATEGORY,
+            ColumnSemanticRole.ACTION_TYPE,
+        }:
+            return PhysicalDataType.TEXT
+        if role is ColumnSemanticRole.TIMESTAMP:
+            return PhysicalDataType.TIMESTAMP
+        raise ValueError(f"unsupported semantic column role: {role!r}")
+
+    @staticmethod
+    def _validate_semantic_schema(
+        blueprint: SchemaBlueprint,
+        semantic_schema: SemanticSchemaPlan,
+    ) -> None:
+        if not isinstance(semantic_schema, SemanticSchemaPlan):
+            raise TypeError("semantic_schema must be SemanticSchemaPlan")
+        expected = {node.node_id for node in blueprint.nodes}
+        actual = {table.table_id for table in semantic_schema.tables}
+        if actual != expected:
+            raise ValueError("semantic schema table IDs do not match blueprint")
+        node_ids = {node.node_id for node in semantic_schema.nodes}
+        if node_ids and node_ids != expected:
+            raise ValueError("semantic schema node IDs do not match blueprint")
 
     def _add_feature_columns(
         self,

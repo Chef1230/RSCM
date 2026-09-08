@@ -283,6 +283,10 @@ def _entity_attribute_score(schema, table_id, columns, rng):
         values = np.asarray(columns[column.column_id])
         if values.dtype.kind in {"b", "i", "u", "f"}:
             encoded = values.astype(np.float64)
+            if not np.isfinite(encoded).all():
+                finite = np.isfinite(encoded)
+                fill = float(np.mean(encoded[finite])) if np.any(finite) else 0.0
+                encoded = np.where(finite, encoded, fill)
         else:
             _unique, encoded = np.unique(values.astype(str), return_inverse=True)
             encoded = encoded.astype(np.float64)

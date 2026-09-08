@@ -7,6 +7,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -28,6 +29,7 @@ from rdb_prior.priors.model import PriorFamily
 from rdb_prior.priors.planner import PriorPlanner, PriorPlannerConfig
 from rdb_prior.runtime import RuntimeContext, digest_config
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
+from rdb_prior.schema.semantics import complete_semantic_schema
 from rdb_prior.schema.graph import (
     SchemaGraphArtifactWriter,
     SchemaGraphConfig,
@@ -443,16 +445,23 @@ def generate_physical_schemas(
             task_plan,
             runtime.child("design"),
         )
-        compilation = components.compiler.compile(
+        logical_semantic_schema = sample_semantic_schema(
+            blueprint,
+            runtime.child("semantic-schema"),
+            schema_id=f"{config.compiler.schema_id_prefix}_{sample_id}",
+        )
+        compilation = _compile_schema_extension(
+            components.compiler,
             blueprint,
             design,
             sample_id,
             runtime,
+            logical_semantic_schema,
         )
         physical_schema = compilation.schema
-        semantic_schema = sample_semantic_schema(
+        semantic_schema = complete_semantic_schema(
+            logical_semantic_schema,
             physical_schema,
-            runtime.child("semantic-schema"),
         )
         runtime_record = runtime.record(
             project_version=config.project_version,
@@ -471,7 +480,7 @@ def generate_physical_schemas(
             semantic_schema=semantic_schema,
             prior_compatibility={
                 "temporal_event_candidate_count": len(
-                    entity_event_candidates(blueprint, physical_schema)
+                    entity_event_candidates(blueprint, physical_schema, semantic_schema)
                 ),
                 "implemented_families": [
                     PriorFamily.LEGACY_ROLE_SCM.value,
@@ -691,6 +700,35 @@ def _run_instance_work_items(
                     progress(completed, len(work_items), result.sample_id)
     results.sort(key=lambda result: result.order)
     return results
+
+
+def _compile_schema_extension(
+    compiler: object,
+    blueprint: object,
+    design: object | None,
+    sample_id: str | int,
+    runtime: RuntimeContext,
+    semantic_schema: object,
+):
+    signature = inspect.signature(compiler.compile)
+    parameters = signature.parameters
+    supports_semantic = (
+        "semantic_schema" in parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+    )
+    if supports_semantic:
+        return compiler.compile(
+            blueprint,
+            design,
+            sample_id,
+            runtime,
+            semantic_schema=semantic_schema,
+        )
+    # Third-party extensions keep the original four-argument contract.
+    return compiler.compile(blueprint, design, sample_id, runtime)
 
 
 def _generate_one_database_instance(

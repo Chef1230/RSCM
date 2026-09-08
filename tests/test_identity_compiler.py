@@ -24,6 +24,13 @@ from rdb_prior.compilation.model import (
     PhysicalSchema,
 )
 from rdb_prior.runtime import RuntimeContext
+from rdb_prior.schema.semantics import (
+    ColumnSemanticRole,
+    SemanticNodePlan,
+    SemanticSchemaPlan,
+    TableSemanticPlan,
+    TableSemanticRole,
+)
 from rdb_prior.schema.sampler import BlueprintSampler, BlueprintSamplerConfig
 from rdb_prior.schema.spec import TableRole
 
@@ -38,6 +45,84 @@ class PhysicalSchemaCompilerTests(unittest.TestCase):
             runtime,
         )
         return blueprint, schema
+
+    def test_semantic_node_plan_controls_physical_columns(self) -> None:
+        sample_id = "semantic_columns"
+        runtime = RuntimeContext(77).for_sample(sample_id)
+        blueprint = BlueprintSampler(
+            BlueprintSamplerConfig(
+                min_tables=3,
+                max_tables=3,
+                min_motif_occurrences=1,
+                max_motif_occurrences=1,
+                max_extra_edges=0,
+                background_attachment_probability=0.0,
+                motif_weights=(("entity_event", 1.0),),
+            )
+        ).sample(sample_id, runtime)
+        tables = []
+        nodes = []
+        for item in blueprint.nodes:
+            role = (
+                TableSemanticRole.ACTOR
+                if item.role is TableRole.ENTITY
+                else (
+                    TableSemanticRole.TRANSACTION
+                    if item.role is TableRole.EVENT
+                    else TableSemanticRole.OBJECT
+                )
+            )
+            required = {
+                TableSemanticRole.ACTOR: (
+                    ColumnSemanticRole.STATIC_ATTRIBUTE,
+                    ColumnSemanticRole.STATE,
+                    ColumnSemanticRole.CATEGORY,
+                ),
+                TableSemanticRole.TRANSACTION: (
+                    ColumnSemanticRole.AMOUNT,
+                    ColumnSemanticRole.ACTION_TYPE,
+                    ColumnSemanticRole.OUTCOME,
+                ),
+                TableSemanticRole.OBJECT: (
+                    ColumnSemanticRole.STATIC_ATTRIBUTE,
+                    ColumnSemanticRole.CATEGORY,
+                ),
+            }[role]
+            tables.append(TableSemanticPlan(table_id=item.node_id, role=role))
+            nodes.append(
+                SemanticNodePlan(
+                    node_id=item.node_id,
+                    role=role,
+                    required_column_roles=required,
+                )
+            )
+        semantic = SemanticSchemaPlan(
+            schema_id="schema_semantic_columns",
+            prototype_id="test",
+            seed=77,
+            tables=tuple(tables),
+            columns=(),
+            nodes=tuple(nodes),
+        )
+        compiler = PhysicalSchemaCompiler(
+            PhysicalCompilerConfig(min_feature_columns=0, max_feature_columns=0)
+        )
+        schema = compiler.compile(
+            blueprint,
+            sample_id,
+            runtime,
+            semantic_schema=semantic,
+        )
+        entity = next(item for item in schema.tables if item.role is TableRole.ENTITY)
+        event = next(item for item in schema.tables if item.role is TableRole.EVENT)
+        self.assertEqual(
+            [PhysicalDataType.DOUBLE, PhysicalDataType.BOOLEAN, PhysicalDataType.TEXT],
+            [item.data_type for item in entity.columns if item.kind is ColumnKind.FEATURE],
+        )
+        self.assertEqual(
+            [PhysicalDataType.DOUBLE, PhysicalDataType.TEXT, PhysicalDataType.BOOLEAN],
+            [item.data_type for item in event.columns if item.kind is ColumnKind.FEATURE],
+        )
 
     def test_compilation_is_deterministic(self) -> None:
         first_blueprint, first_schema = self._compile()

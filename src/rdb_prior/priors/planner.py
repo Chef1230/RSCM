@@ -178,7 +178,11 @@ class PriorPlanner:
     ) -> DatabasePriorPlan:
         if semantic_schema.schema_id != physical_schema.schema_id:
             raise ValueError("semantic schema does not belong to physical schema")
-        candidates = entity_event_candidates(blueprint, physical_schema)
+        candidates = entity_event_candidates(
+            blueprint,
+            physical_schema,
+            semantic_schema,
+        )
         if self.config.composition is None:
             family = self._family(runtime, bool(candidates))
             components = self._default_composition(family, runtime)
@@ -201,7 +205,7 @@ class PriorPlanner:
         for occurrence in blueprint.motif_occurrences:
             candidate = temporal_by_occurrence.get(occurrence.occurrence_id)
             if family is not PriorFamily.TEMPORAL_EVENT or candidate is None:
-                bundles.append(self._legacy_bundle(occurrence))
+                bundles.append(self._legacy_bundle(occurrence, semantic_schema))
                 continue
 
             state_id = f"state_{candidate.entity_table_id}_{occurrence.occurrence_id}"
@@ -236,6 +240,7 @@ class PriorPlanner:
                     shared_state_id=state_id,
                     temporal_state_id=temporal_state_id,
                     components=components,
+                    semantic_schema=semantic_schema,
                 )
             )
         plan_id = f"prior_plan_{physical_schema.schema_id}"
@@ -315,13 +320,25 @@ class PriorPlanner:
             temporal=TemporalPriorKind.STATIC,
         )
 
-    def _legacy_bundle(self, occurrence: object) -> MotifMechanismBundle:
+    def _legacy_bundle(
+        self,
+        occurrence: object,
+        semantic_schema: SemanticSchemaPlan | None = None,
+    ) -> MotifMechanismBundle:
         node_bindings = tuple(
             TableMechanismBinding(
                 table_id=table_id,
                 mechanism_ids=("legacy_role_scm",),
             )
             for _slot, table_id in occurrence.node_bindings
+        )
+        semantic_roles = (
+            [
+                [slot, semantic_schema.table_role(table_id).value]
+                for slot, table_id in occurrence.node_bindings
+            ]
+            if semantic_schema is not None
+            else []
         )
         return MotifMechanismBundle(
             bundle_id=f"bundle_{occurrence.occurrence_id}",
@@ -335,6 +352,7 @@ class PriorPlanner:
             temporal_mechanism=mechanism_ref(TemporalPriorKind.STATIC),
             process_mechanism=mechanism_ref(ProcessPriorKind.NONE),
             compatible_task_families=(),
+            parameters=(("semantic_table_roles", semantic_roles),),
         )
 
     def _temporal_bundle(
@@ -347,11 +365,31 @@ class PriorPlanner:
         shared_state_id: str,
         temporal_state_id: str | None,
         components: PriorCompositionConfig,
+        semantic_schema: SemanticSchemaPlan,
     ) -> MotifMechanismBundle:
+        entity_role = semantic_schema.table_role(entity_table_id)
+        event_role = semantic_schema.table_role(event_table_id)
+        event_column_roles = tuple(
+            item.role.value
+            for item in semantic_schema.columns
+            if item.column_id.startswith(f"{event_table_id}_")
+        )
+        semantic_weights = [
+            [key, value]
+            for key, value in self._semantic_mechanism_weights(
+                entity_role,
+                event_role,
+                event_column_roles,
+            )
+        ]
         parameters: tuple[tuple[str, object], ...] = (
             ("entity_table_id", entity_table_id),
             ("event_table_id", event_table_id),
             ("state_id", shared_state_id),
+            ("semantic_entity_role", entity_role.value),
+            ("semantic_event_role", event_role.value),
+            ("semantic_event_column_roles", list(event_column_roles)),
+            ("semantic_mechanism_weights", semantic_weights),
         )
         entity_mechanisms = (shared_state_id, "entity_state")
         event_mechanisms = ("event_count", "event_time", "event_attributes")
@@ -397,6 +435,50 @@ class PriorPlanner:
             shared_state_ids=(shared_state_id,),
             compatible_task_families=("entity_future_event_existence",),
             parameters=parameters,
+        )
+
+    @staticmethod
+    def _semantic_mechanism_weights(
+        entity_role: object,
+        event_role: object,
+        event_column_roles: tuple[str, ...] = (),
+    ) -> tuple[tuple[str, float], ...]:
+        entity = getattr(entity_role, "value", str(entity_role))
+        event = getattr(event_role, "value", str(event_role))
+        if entity == "actor" and event == "transaction":
+            weights = {
+                "attribute": 0.35,
+                "intensity": 0.40,
+                "temporal": 0.25,
+            }
+        elif entity == "object" and event == "observation":
+            weights = {
+                "attribute": 0.25,
+                "intensity": 0.20,
+                "temporal": 0.55,
+            }
+        elif event == "state_change":
+            weights = {
+                "attribute": 0.20,
+                "intensity": 0.25,
+                "temporal": 0.55,
+            }
+        else:
+            weights = {
+                "attribute": 0.34,
+                "intensity": 0.33,
+                "temporal": 0.33,
+            }
+        if "amount" in event_column_roles:
+            weights["intensity"] += 0.08
+        if "measurement" in event_column_roles:
+            weights["temporal"] += 0.08
+        if "outcome" in event_column_roles:
+            weights["attribute"] += 0.04
+        total = sum(weights.values())
+        return tuple(
+            (key, float(value / total))
+            for key, value in sorted(weights.items())
         )
 
     def _temporal_state_plan(

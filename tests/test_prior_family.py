@@ -53,7 +53,14 @@ from rdb_prior.priors.planner import (
 )
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
+from rdb_prior.schema.semantics import (
+    SemanticNodePlan,
+    SemanticSchemaPlan,
+    TableSemanticPlan,
+    TableSemanticRole,
+)
 from rdb_prior.schema.sampler import BlueprintSampler, BlueprintSamplerConfig
+from rdb_prior.schema.spec import TableRole
 from rdb_prior.task.program import TaskExecutor, TaskProgramPlanner
 from rdb_prior.task.artifacts import load_task_artifact
 from rdb_prior.task.pipeline import TaskPipelineConfig, generate_tasks
@@ -117,6 +124,77 @@ class PriorFamilyTests(unittest.TestCase):
         )
         materialization = DatabaseGenerator().materialize(schema=schema, plan=plan)
         return runtime, schema, prior, materialization.plan, materialization.database
+
+    def test_semantic_roles_change_bundle_mechanism_weights(self) -> None:
+        runtime = RuntimeContext(91).for_sample("semantic_weights")
+        blueprint = BlueprintSampler(
+            BlueprintSamplerConfig(
+                min_tables=3,
+                max_tables=3,
+                min_motif_occurrences=1,
+                max_motif_occurrences=1,
+                max_extra_edges=0,
+                background_attachment_probability=0.0,
+                motif_weights=(("entity_event", 1.0),),
+            )
+        ).sample("semantic_weights", runtime)
+        schema = PhysicalSchemaCompiler().compile(
+            blueprint,
+            "semantic_weights",
+            runtime,
+        )
+        base = sample_semantic_schema(schema, runtime.child("semantic"))
+        entity_id = next(item.table_id for item in base.tables if schema.table(item.table_id).role is TableRole.ENTITY)
+        event_id = next(item.table_id for item in base.tables if schema.table(item.table_id).role is TableRole.EVENT)
+        def with_roles(entity_role, event_role):
+            tables = tuple(
+                TableSemanticPlan(
+                    table_id=item.table_id,
+                    role=(
+                        entity_role if item.table_id == entity_id
+                        else event_role if item.table_id == event_id
+                        else item.role
+                    ),
+                )
+                for item in base.tables
+            )
+            nodes = tuple(
+                SemanticNodePlan(node_id=item.table_id, role=item.role)
+                for item in tables
+            )
+            return SemanticSchemaPlan(
+                schema_id=schema.schema_id,
+                prototype_id=base.prototype_id,
+                seed=base.seed,
+                tables=tables,
+                columns=base.columns,
+                nodes=nodes,
+            )
+        policy = TaskPolicyPlan(programs_per_database=1)
+        planner = PriorPlanner(
+            PriorPlannerConfig(
+                database_family_weights=((PriorFamily.TEMPORAL_EVENT, 1.0),),
+                task_policy=policy,
+            )
+        )
+        actor_transaction = planner.plan(
+            blueprint=blueprint,
+            physical_schema=schema,
+            semantic_schema=with_roles(TableSemanticRole.ACTOR, TableSemanticRole.TRANSACTION),
+            runtime=runtime.child("prior-a"),
+        )
+        object_observation = planner.plan(
+            blueprint=blueprint,
+            physical_schema=schema,
+            semantic_schema=with_roles(TableSemanticRole.OBJECT, TableSemanticRole.OBSERVATION),
+            runtime=runtime.child("prior-b"),
+        )
+        first = next(item for item in actor_transaction.motif_bundles if item.family is PriorFamily.TEMPORAL_EVENT)
+        second = next(item for item in object_observation.motif_bundles if item.family is PriorFamily.TEMPORAL_EVENT)
+        self.assertNotEqual(
+            dict(first.parameters)["semantic_mechanism_weights"],
+            dict(second.parameters)["semantic_mechanism_weights"],
+        )
 
     def test_temporal_entity_event_is_jointly_planned_and_valid(self) -> None:
         runtime, schema, prior, plan, database = self._temporal_fixture()

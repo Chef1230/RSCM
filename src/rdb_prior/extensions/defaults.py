@@ -12,6 +12,7 @@ from rdb_prior.compilation.model import CompilationResult
 from rdb_prior.extensions.interfaces import ExtensionBundle
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.blueprint import SchemaBlueprint
+from rdb_prior.schema.semantics import SemanticSchemaPlan
 from rdb_prior.schema.sampler import BlueprintSampler, BlueprintSamplerConfig
 
 
@@ -78,8 +79,15 @@ class IdentitySchemaCompiler:
         design: object | None,
         sample_id: str | int,
         runtime: RuntimeContext,
+        *,
+        semantic_schema: SemanticSchemaPlan | None = None,
     ) -> CompilationResult:
-        return self.compiler.compile_result(blueprint, sample_id, runtime)
+        return self.compiler.compile_result(
+            blueprint,
+            sample_id,
+            runtime,
+            semantic_schema=semantic_schema,
+        )
 
 
 def default_extension_bundle(
