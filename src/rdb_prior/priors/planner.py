@@ -33,6 +33,7 @@ from rdb_prior.priors.model import (
     TransitionMechanismPlan,
 )
 from rdb_prior.priors.registry import descriptor, is_implemented, mechanism_ref
+from rdb_prior.nuisance.planner import NuisanceOverlayConfig, NuisancePlanner
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.blueprint import SchemaBlueprint
 from rdb_prior.schema.semantics import SemanticSchemaPlan
@@ -235,6 +236,7 @@ class PriorPlannerConfig:
     composition: PriorCompositionConfig | None = None
     relational_scm: RelationSCMConfig = RelationSCMConfig()
     relational_tree: RelationTreeConfig = RelationTreeConfig()
+    nuisance: NuisanceOverlayConfig = NuisanceOverlayConfig()
 
     def __post_init__(self) -> None:
         if not isinstance(self.database_family_weights, tuple) or not self.database_family_weights:
@@ -262,6 +264,8 @@ class PriorPlannerConfig:
             raise TypeError("relational_scm must be RelationSCMConfig")
         if not isinstance(self.relational_tree, RelationTreeConfig):
             raise TypeError("relational_tree must be RelationTreeConfig")
+        if not isinstance(self.nuisance, NuisanceOverlayConfig):
+            raise TypeError("nuisance must be NuisanceOverlayConfig")
         if (
             self.composition is not None
             and not isinstance(self.composition, PriorCompositionConfig)
@@ -403,15 +407,19 @@ class PriorPlanner:
             bundles.append(self._legacy_bundle(occurrence, semantic_schema))
         plan_id = f"prior_plan_{physical_schema.schema_id}"
         seed = runtime.seed("prior", "global")
+        nuisance_plan = NuisancePlanner(self.config.nuisance).plan(
+            schema=physical_schema,
+            semantic_schema=semantic_schema,
+            runtime=runtime.child("nuisance"),
+            mechanism=components.nuisance,
+        )
         composition = PriorCompositionPlan(
             plan_id=plan_id,
             semantic_schema=semantic_schema,
             shared_states=tuple(states),
             temporal_states=tuple(temporal_states),
             motif_bundles=tuple(bundles),
-            nuisance_plan=NuisancePlan(
-                mechanism=mechanism_ref(components.nuisance)
-            ),
+            nuisance_plan=nuisance_plan,
             task_policy=self.config.task_policy,
             seed=seed,
         )
@@ -471,23 +479,27 @@ class PriorPlanner:
                 attribute=AttributePriorKind.COLUMN_SCM,
                 relation=RelationPriorKind.STATE_CONDITIONED_EVENT,
                 temporal=temporal,
+                nuisance=self.config.nuisance.kind,
             )
         if family is PriorFamily.RELATIONAL_TREE:
             return PriorCompositionConfig(
                 attribute=AttributePriorKind.TREE,
                 relation=RelationPriorKind.TREE,
                 temporal=TemporalPriorKind.STATIC,
+                nuisance=self.config.nuisance.kind,
             )
         if family is PriorFamily.RELATIONAL_SCM:
             return PriorCompositionConfig(
                 attribute=AttributePriorKind.COLUMN_SCM,
                 relation=RelationPriorKind.SCM,
                 temporal=TemporalPriorKind.STATIC,
+                nuisance=self.config.nuisance.kind,
             )
         return PriorCompositionConfig(
             attribute=AttributePriorKind.LEGACY_SCM,
             relation=RelationPriorKind.LATENT_AFFINITY,
             temporal=TemporalPriorKind.STATIC,
+            nuisance=self.config.nuisance.kind,
         )
 
     def _relational_scm_bundle(

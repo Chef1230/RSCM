@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import json
 from typing import Any, Mapping
@@ -574,19 +574,231 @@ class TaskPolicyPlan:
         return cls(**{name: data.get(name, field.default) for name, field in cls.__dataclass_fields__.items()})
 
 
+class NuisanceColumnRole(str, Enum):
+    """Private role of an observed nuisance column."""
+
+    CAUSAL = "causal"
+    PROXY = "proxy"
+    SPURIOUS = "spurious"
+    REDUNDANT = "redundant"
+    IRRELEVANT = "irrelevant"
+    PURE_NOISE = "pure_noise"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class NuisanceColumnPlan:
+    """Overlay contract for one physical feature column."""
+
+    column_id: str
+    role: NuisanceColumnRole
+    source_column_ids: tuple[str, ...] = ()
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("column_id", self.column_id)
+        if not isinstance(self.role, NuisanceColumnRole):
+            raise TypeError("role must be NuisanceColumnRole")
+        _optional_identifier_tuple("source_column_ids", self.source_column_ids)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "column_id": self.column_id,
+            "role": self.role.value,
+            "source_column_ids": list(self.source_column_ids),
+            "parameters": dict(self.parameters),
+        }
+
+    @property
+    def column_role(self) -> NuisanceColumnRole:
+        return self.role
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NuisanceColumnPlan":
+        return cls(
+            column_id=data["column_id"],
+            role=NuisanceColumnRole(data["role"]),
+            source_column_ids=tuple(data.get("source_column_ids", ())),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MissingnessPlan:
+    """One explicit MCAR/MAR/MNAR or structured missingness overlay."""
+
+    column_id: str
+    family: str
+    rate: float
+    driver_column_ids: tuple[str, ...] = ()
+    block_size: int = 0
+    time_column_id: str | None = None
+    seed: int = 0
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("column_id", self.column_id)
+        _identifier("missingness family", self.family)
+        if isinstance(self.rate, bool) or not isinstance(self.rate, (int, float)):
+            raise TypeError("missingness rate must be numeric")
+        if not 0 <= self.rate < 1:
+            raise ValueError("missingness rate must be in [0, 1)")
+        _optional_identifier_tuple("driver_column_ids", self.driver_column_ids)
+        if isinstance(self.block_size, bool) or not isinstance(self.block_size, int) or self.block_size < 0:
+            raise ValueError("block_size must be a non-negative integer")
+        if self.time_column_id is not None:
+            _identifier("time_column_id", self.time_column_id)
+        _seed("missingness seed", self.seed)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "column_id": self.column_id,
+            "family": self.family,
+            "rate": float(self.rate),
+            "driver_column_ids": list(self.driver_column_ids),
+            "block_size": self.block_size,
+            "time_column_id": self.time_column_id,
+            "seed": self.seed,
+            "parameters": dict(self.parameters),
+        }
+
+    @property
+    def mechanism(self) -> str:
+        return self.family
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MissingnessPlan":
+        return cls(
+            column_id=data["column_id"],
+            family=data["family"],
+            rate=data.get("rate", 0.0),
+            driver_column_ids=tuple(data.get("driver_column_ids", ())),
+            block_size=data.get("block_size", 0),
+            time_column_id=data.get("time_column_id"),
+            seed=data.get("seed", 0),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DistractorRelationPlan:
+    """An optional weak/irrelevant relation overlay on an existing FK."""
+
+    relation_id: str
+    family: str
+    parent_table_id: str
+    child_table_id: str
+    strength: float = 0.0
+    seed: int = 0
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        for name in ("relation_id", "family", "parent_table_id", "child_table_id"):
+            _identifier(name, getattr(self, name))
+        if isinstance(self.strength, bool) or not isinstance(self.strength, (int, float)):
+            raise TypeError("relation distractor strength must be numeric")
+        if not 0 <= self.strength <= 1:
+            raise ValueError("relation distractor strength must be in [0, 1]")
+        _seed("relation distractor seed", self.seed)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "relation_id": self.relation_id,
+            "family": self.family,
+            "parent_table_id": self.parent_table_id,
+            "child_table_id": self.child_table_id,
+            "strength": float(self.strength),
+            "seed": self.seed,
+            "parameters": dict(self.parameters),
+        }
+
+    @property
+    def relation_group_id(self) -> str:
+        return self.relation_id
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DistractorRelationPlan":
+        return cls(
+            relation_id=data["relation_id"],
+            family=data["family"],
+            parent_table_id=data["parent_table_id"],
+            child_table_id=data["child_table_id"],
+            strength=data.get("strength", 0.0),
+            seed=data.get("seed", 0),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class NuisancePlan:
-    mechanism: MechanismRef
+    """Orthogonal overlay plan; legacy is a deterministic no-op."""
+
+    mechanism: MechanismRef = field(
+        default_factory=lambda: MechanismRef(
+            kind=NuisancePriorKind.LEGACY.value,
+            version="v1",
+        )
+    )
+    column_roles: tuple[NuisanceColumnPlan, ...] = ()
+    missingness_plans: tuple[MissingnessPlan, ...] = ()
+    distractor_relation_plans: tuple[DistractorRelationPlan, ...] = ()
+    environment_id: str = "env_default"
+    enabled: bool = False
+    parameters: tuple[tuple[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         _kind_ref(self.mechanism, NuisancePriorKind, "nuisance")
+        for name, item_type in (
+            ("column_roles", NuisanceColumnPlan),
+            ("missingness_plans", MissingnessPlan),
+            ("distractor_relation_plans", DistractorRelationPlan),
+        ):
+            values = getattr(self, name)
+            if not isinstance(values, tuple) or not all(isinstance(item, item_type) for item in values):
+                raise TypeError(f"{name} must contain {item_type.__name__} values")
+        if not isinstance(self.environment_id, str) or not self.environment_id.strip():
+            raise ValueError("environment_id must not be empty")
+        if not isinstance(self.enabled, bool):
+            raise TypeError("enabled must be a bool")
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+        if len({item.column_id for item in self.column_roles}) != len(self.column_roles):
+            raise ValueError("nuisance column IDs must be unique")
+        if len({item.column_id for item in self.missingness_plans}) != len(self.missingness_plans):
+            raise ValueError("missingness column IDs must be unique")
+        if len({item.relation_id for item in self.distractor_relation_plans}) != len(self.distractor_relation_plans):
+            raise ValueError("distractor relation IDs must be unique")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"mechanism": self.mechanism.to_dict()}
+        return {
+            "mechanism": self.mechanism.to_dict(),
+            "column_roles": [item.to_dict() for item in self.column_roles],
+            "missingness_plans": [item.to_dict() for item in self.missingness_plans],
+            "distractor_relation_plans": [item.to_dict() for item in self.distractor_relation_plans],
+            "environment_id": self.environment_id,
+            "enabled": self.enabled,
+            "parameters": dict(self.parameters),
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "NuisancePlan":
-        return cls(mechanism=MechanismRef.from_dict(data["mechanism"]))
+        if not isinstance(data, Mapping):
+            data = {}
+        mechanism = data.get("mechanism")
+        return cls(
+            mechanism=(
+                MechanismRef.from_dict(mechanism)
+                if isinstance(mechanism, Mapping)
+                else MechanismRef(kind=NuisancePriorKind.LEGACY.value, version="v1")
+            ),
+            column_roles=tuple(NuisanceColumnPlan.from_dict(item) for item in data.get("column_roles", ())),
+            missingness_plans=tuple(MissingnessPlan.from_dict(item) for item in data.get("missingness_plans", ())),
+            distractor_relation_plans=tuple(DistractorRelationPlan.from_dict(item) for item in data.get("distractor_relation_plans", ())),
+            environment_id=data.get("environment_id", "env_default"),
+            enabled=data.get("enabled", False),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -686,7 +898,7 @@ class PriorCompositionPlan:
                 MotifMechanismBundle.from_dict(item)
                 for item in data.get("motif_bundles", ())
             ),
-            nuisance_plan=NuisancePlan.from_dict(data["nuisance_plan"]),
+            nuisance_plan=NuisancePlan.from_dict(data.get("nuisance_plan", {})),
             task_policy=TaskPolicyPlan.from_dict(data.get("task_policy", {})),
             seed=data["seed"],
         )
@@ -821,6 +1033,10 @@ __all__ = [
     "TemporalPriorKind",
     "ProcessPriorKind",
     "NuisancePriorKind",
+    "NuisanceColumnRole",
+    "NuisanceColumnPlan",
+    "MissingnessPlan",
+    "DistractorRelationPlan",
     "MechanismRef",
     "NuisancePlan",
     "PriorCompositionPlan",

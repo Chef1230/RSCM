@@ -29,6 +29,7 @@ from rdb_prior.instance.planner import InstancePlannerConfig, RoleSCMPrior
 from rdb_prior.pipeline import InstancePipelineConfig, SchemaPipelineConfig
 from rdb_prior.priors.model import (
     PriorFamily,
+    NuisancePriorKind,
     StateSpacePlan,
     StateVisibility,
     TaskPolicyPlan,
@@ -40,6 +41,7 @@ from rdb_prior.priors.planner import (
     RelationTreeConfig,
     TemporalStateConfig,
 )
+from rdb_prior.nuisance.planner import NuisanceOverlayConfig
 from rdb_prior.routing.config import (
     RoutedH5Config,
     RouterModelConfig,
@@ -635,6 +637,7 @@ _PRIOR_OPTIONS = {
     "temporal_state",
     "relational_tree",
     "relational_scm",
+    "nuisance",
 }
 
 _PRIOR_SHARED_STATE_OPTIONS = {"family", "dimension"}
@@ -659,6 +662,18 @@ _PRIOR_RELATIONAL_TREE_OPTIONS = {
     "use_for_attributes",
     "use_for_event_intensity",
     "use_for_relation_propensity",
+}
+
+_PRIOR_NUISANCE_OPTIONS = {
+    "enabled",
+    "kind",
+    "environment_id",
+    "missing_rate_min",
+    "missing_rate_max",
+    "proxy_noise_scale",
+    "spurious_strength",
+    "distractor_relation_count",
+    "distractor_strength",
 }
 
 _PRIOR_RELATIONAL_SCM_OPTIONS = {
@@ -1481,6 +1496,9 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
         relational_scm=_relational_scm_config(
             _mapping(raw.get("relational_scm", {}), "config.prior.relational_scm")
         ),
+        nuisance=_nuisance_config(
+            _mapping(raw.get("nuisance", {}), "config.prior.nuisance")
+        ),
     )
 
 
@@ -1499,6 +1517,29 @@ def _shared_state_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "family": shared.get("family", "gaussian_mixture"),
         "dimension": shared.get("dimension", raw.get("state_dimension", 4)),
     }
+
+
+def _nuisance_config(raw: Mapping[str, Any]) -> NuisanceOverlayConfig:
+    _reject_unknown(raw, _PRIOR_NUISANCE_OPTIONS, "config.prior.nuisance")
+    try:
+        kind = NuisancePriorKind(raw.get("kind", NuisancePriorKind.LEGACY.value))
+    except ValueError as error:
+        raise SchemaConfigError(
+            "config.prior.nuisance.kind must be one of: "
+            + ", ".join(item.value for item in NuisancePriorKind)
+        ) from error
+    defaults = NuisanceOverlayConfig()
+    values = {
+        name: raw.get(name, getattr(defaults, name))
+        for name in defaults.__dataclass_fields__
+    }
+    values["kind"] = kind
+    try:
+        return NuisanceOverlayConfig(**values)
+    except (TypeError, ValueError) as error:
+        raise SchemaConfigError(
+            f"Invalid config.prior.nuisance: {error}"
+        ) from error
 
 
 def _relational_scm_config(raw: Mapping[str, Any]) -> RelationSCMConfig:

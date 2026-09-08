@@ -63,6 +63,7 @@ def bind_relational_tree_plan(
         prior_composition_id=prior_plan.composition.plan_id,
         prior_family=prior_plan.family.value,
         motif_bundles=prior_plan.motif_bundles,
+        nuisance_plan=prior_plan.composition.nuisance_plan,
         column_mechanisms=column_mechanisms,
     )
 

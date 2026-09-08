@@ -11,6 +11,7 @@ from rdb_prior.generation.dispatch import finalize_plan, requires_finalization
 from rdb_prior.generation.features import generate_table_features
 from rdb_prior.generation.latent import generate_latent_registry
 from rdb_prior.generation.model import DatabaseInstance, TableData
+from rdb_prior.nuisance.executor import apply_nuisance_overlay
 from rdb_prior.generation.relations import generate_relations
 from rdb_prior.generation.state_trajectory import TemporalStateRegistry
 from rdb_prior.generation.temporal_processes import (
@@ -91,11 +92,27 @@ class DatabaseGenerator:
         )
         if not apply_temporal:
             return database
-        return apply_temporal_event_processes(
+        generated = apply_temporal_event_processes(
             schema,
             plan,
             database,
             include_private_state=include_private_state,
+        )
+        if isinstance(generated, TemporalEventMaterialization):
+            return TemporalEventMaterialization(
+                database=apply_nuisance_overlay(
+                    schema=schema,
+                    database=generated.database,
+                    plan=plan,
+                    latents=latents,
+                ),
+                temporal_states=generated.temporal_states,
+            )
+        return apply_nuisance_overlay(
+            schema=schema,
+            database=generated,
+            plan=plan,
+            latents=latents,
         )
 
     def materialize(

@@ -21,7 +21,7 @@ from rdb_prior.runtime import RuntimeRecord
 from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.generation.state_trajectory import TemporalStateRegistry
 from rdb_prior.instance.plan import InstancePlan
-from rdb_prior.priors.model import DatabasePriorPlan
+from rdb_prior.priors.model import DatabasePriorPlan, NuisancePlan
 from rdb_prior.schema.blueprint import SchemaBlueprint
 from rdb_prior.schema.semantics import SemanticSchemaPlan
 from rdb_prior.task.program import TaskProgramPlan
@@ -263,6 +263,10 @@ class InstanceArtifactWriter:
         temporary.mkdir()
         try:
             _write_json_file(temporary / "instance_plan.json", plan.to_dict())
+            _write_json_file(
+                temporary / "nuisance_plan.json",
+                plan.nuisance_plan.to_dict(),
+            )
             if prior_plan is not None:
                 _write_json_file(temporary / "database_prior_plan.json", prior_plan.to_dict())
             if task_programs:
@@ -306,6 +310,7 @@ class InstanceArtifactWriter:
                     "plan_id": plan.plan_id,
                     "schema_artifact": schema_artifact,
                     "plan": "instance_plan.json",
+                    "nuisance_plan": "nuisance_plan.json",
                     "runtime": "runtime.json",
                     "validation": "validation.json",
                     "database_prior_plan": (
@@ -367,6 +372,7 @@ class InstanceArtifact:
     prior_plan: DatabasePriorPlan | None = None
     task_programs: tuple[TaskProgramPlan, ...] = ()
     temporal_state_registry: TemporalStateRegistry | None = None
+    nuisance_plan: NuisancePlan | None = None
 
 
 def load_instance_artifact(path: str | Path) -> InstanceArtifact:
@@ -408,6 +414,14 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
     if programs_file is not None:
         program_payload = json.loads((root / programs_file).read_text(encoding="utf-8"))
         task_programs = tuple(TaskProgramPlan.from_dict(item) for item in program_payload.get("programs", ()))
+    nuisance_file = payload.get("nuisance_plan")
+    nuisance_plan = (
+        plan.nuisance_plan
+        if nuisance_file is None
+        else NuisancePlan.from_dict(
+            json.loads((root / nuisance_file).read_text(encoding="utf-8"))
+        )
+    )
     trajectory_file = payload.get("temporal_state_trajectory")
     temporal_state_registry = (
         None
@@ -427,6 +441,7 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
         prior_plan=prior_plan,
         task_programs=task_programs,
         temporal_state_registry=temporal_state_registry,
+        nuisance_plan=nuisance_plan,
     )
 
 

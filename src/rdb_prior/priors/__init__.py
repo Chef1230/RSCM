@@ -2,6 +2,12 @@
 
 from rdb_prior.priors.model import (
     DatabasePriorPlan,
+    DistractorRelationPlan,
+    MissingnessPlan,
+    NuisanceColumnPlan,
+    NuisanceColumnRole,
+    NuisancePlan,
+    NuisancePriorKind,
     DurationMechanismPlan,
     MotifMechanismBundle,
     PriorFamily,
@@ -15,6 +21,7 @@ from rdb_prior.priors.model import (
     TransitionClock,
     TransitionMechanismPlan,
 )
+from rdb_prior.nuisance.planner import NuisanceOverlayConfig, NuisancePlanner
 from rdb_prior.priors.planner import (
     PriorPlanner,
     PriorPlannerConfig,
@@ -37,6 +44,14 @@ __all__ = [
     "MotifMechanismBundle",
     "TaskPolicyPlan",
     "DatabasePriorPlan",
+    "NuisanceColumnRole",
+    "NuisanceColumnPlan",
+    "MissingnessPlan",
+    "DistractorRelationPlan",
+    "NuisancePlan",
+    "NuisancePriorKind",
+    "NuisanceOverlayConfig",
+    "NuisancePlanner",
     "TemporalStateConfig",
     "RelationSCMConfig",
     "RelationTreeConfig",

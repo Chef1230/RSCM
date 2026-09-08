@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from rdb_prior.generation.trees.model import ForestPlan
 from rdb_prior.priors.model import (
     MotifMechanismBundle,
+    NuisancePlan,
     SharedStatePlan,
     TemporalStatePlan,
 )
@@ -278,6 +279,7 @@ class InstancePlan:
     column_mechanisms: tuple[ColumnMechanismPlan, ...] = ()
     population_mechanisms: tuple[PopulationMechanismPlan, ...] = ()
     temporal_processes: tuple[TemporalProcessPlan, ...] = ()
+    nuisance_plan: NuisancePlan = NuisancePlan()
 
     def __post_init__(self) -> None:
         for name in ("plan_id", "sample_id", "schema_id", "blueprint_id"):
@@ -371,6 +373,8 @@ class InstancePlan:
             values = getattr(self, name)
             if not isinstance(values, tuple) or not all(isinstance(item, item_type) for item in values):
                 raise TypeError(f"{name} must contain {item_type.__name__} values")
+        if not isinstance(self.nuisance_plan, NuisancePlan):
+            raise TypeError("nuisance_plan must be NuisancePlan")
         object.__setattr__(self, "parameters", _parameters(self.parameters))
 
     def table(self, table_id: str) -> TableMechanismPlan:
@@ -448,6 +452,7 @@ class InstancePlan:
             "temporal_processes": [
                 item.to_dict() for item in self.temporal_processes
             ],
+            "nuisance_plan": self.nuisance_plan.to_dict(),
         }
 
     @classmethod
@@ -536,6 +541,7 @@ class InstancePlan:
             ),
             population_mechanisms=tuple(PopulationMechanismPlan.from_dict(item) for item in data.get("population_mechanisms", ())),
             temporal_processes=tuple(TemporalProcessPlan.from_dict(item) for item in data.get("temporal_processes", ())),
+            nuisance_plan=NuisancePlan.from_dict(data.get("nuisance_plan", {})),
         )
 
 

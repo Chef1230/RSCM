@@ -342,6 +342,17 @@ class InstancePipelineConfig:
                                 "family": self.prior.temporal_state.visibility.value,
                             },
                         },
+                        "nuisance": {
+                            "enabled": self.prior.nuisance.enabled,
+                            "kind": self.prior.nuisance.kind.value,
+                            "environment_id": self.prior.nuisance.environment_id,
+                            "missing_rate_min": self.prior.nuisance.missing_rate_min,
+                            "missing_rate_max": self.prior.nuisance.missing_rate_max,
+                            "proxy_noise_scale": self.prior.nuisance.proxy_noise_scale,
+                            "spurious_strength": self.prior.nuisance.spurious_strength,
+                            "distractor_relation_count": self.prior.nuisance.distractor_relation_count,
+                            "distractor_strength": self.prior.nuisance.distractor_strength,
+                        },
                     }
                 ),
             },
