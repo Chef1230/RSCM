@@ -7,7 +7,11 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from rdb_prior.priors.model import MotifMechanismBundle
+from rdb_prior.priors.model import (
+    MotifMechanismBundle,
+    SharedStatePlan,
+    TemporalStatePlan,
+)
 from rdb_prior.schema.spec import TableRole
 
 
@@ -109,6 +113,7 @@ class TemporalProcessPlan:
     table_id: str
     family: str
     state_ids: tuple[str, ...] = ()
+    temporal_state_ids: tuple[str, ...] = ()
     covariate_column_ids: tuple[str, ...] = ()
     parameters: tuple[tuple[str, object], ...] = ()
 
@@ -116,15 +121,30 @@ class TemporalProcessPlan:
         _identifier("table_id", self.table_id)
         _identifier("family", self.family)
         _optional_identifier_tuple("state_ids", self.state_ids)
+        _optional_identifier_tuple("temporal_state_ids", self.temporal_state_ids)
         _optional_identifier_tuple("covariate_column_ids", self.covariate_column_ids)
         object.__setattr__(self, "parameters", _json_parameters(self.parameters))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"table_id": self.table_id, "family": self.family, "state_ids": list(self.state_ids), "covariate_column_ids": list(self.covariate_column_ids), "parameters": dict(self.parameters)}
+        return {
+            "table_id": self.table_id,
+            "family": self.family,
+            "state_ids": list(self.state_ids),
+            "temporal_state_ids": list(self.temporal_state_ids),
+            "covariate_column_ids": list(self.covariate_column_ids),
+            "parameters": dict(self.parameters),
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TemporalProcessPlan":
-        return cls(table_id=data["table_id"], family=data["family"], state_ids=tuple(data.get("state_ids", ())), covariate_column_ids=tuple(data.get("covariate_column_ids", ())), parameters=tuple(data.get("parameters", {}).items()))
+        return cls(
+            table_id=data["table_id"],
+            family=data["family"],
+            state_ids=tuple(data.get("state_ids", ())),
+            temporal_state_ids=tuple(data.get("temporal_state_ids", ())),
+            covariate_column_ids=tuple(data.get("covariate_column_ids", ())),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -243,6 +263,8 @@ class InstancePlan:
     prior_family: str = "legacy_role_scm"
     motif_bundles: tuple[MotifMechanismBundle, ...] = ()
     shared_state_ids: tuple[str, ...] = ()
+    shared_states: tuple[SharedStatePlan, ...] = ()
+    temporal_state_plans: tuple[TemporalStatePlan, ...] = ()
     column_mechanisms: tuple[ColumnMechanismPlan, ...] = ()
     population_mechanisms: tuple[PopulationMechanismPlan, ...] = ()
     temporal_processes: tuple[TemporalProcessPlan, ...] = ()
@@ -300,6 +322,35 @@ class InstancePlan:
         ):
             raise TypeError("motif_bundles must contain MotifMechanismBundle values")
         _optional_identifier_tuple("shared_state_ids", self.shared_state_ids)
+        if not isinstance(self.shared_states, tuple) or not all(
+            isinstance(item, SharedStatePlan) for item in self.shared_states
+        ):
+            raise TypeError("shared_states must contain SharedStatePlan values")
+        if not isinstance(self.temporal_state_plans, tuple) or not all(
+            isinstance(item, TemporalStatePlan) for item in self.temporal_state_plans
+        ):
+            raise TypeError(
+                "temporal_state_plans must contain TemporalStatePlan values"
+            )
+        if len({item.state_id for item in self.shared_states}) != len(
+            self.shared_states
+        ):
+            raise ValueError("shared state IDs must be unique")
+        if len({item.state_id for item in self.temporal_state_plans}) != len(
+            self.temporal_state_plans
+        ):
+            raise ValueError("temporal state IDs must be unique")
+        if self.shared_states and set(self.shared_state_ids) != {
+            item.state_id for item in self.shared_states
+        }:
+            raise ValueError("shared_state_ids must match shared_states")
+        known_shared = {item.state_id for item in self.shared_states}
+        if any(
+            item.shared_state_id not in known_shared
+            for item in self.temporal_state_plans
+        ):
+            raise ValueError("temporal states must reference shared states")
+
         for name, item_type in (
             ("column_mechanisms", ColumnMechanismPlan),
             ("population_mechanisms", PopulationMechanismPlan),
@@ -366,9 +417,19 @@ class InstancePlan:
             "prior_family": self.prior_family,
             "motif_bundles": [item.to_dict() for item in self.motif_bundles],
             "shared_state_ids": list(self.shared_state_ids),
-            "column_mechanisms": [item.to_dict() for item in self.column_mechanisms],
-            "population_mechanisms": [item.to_dict() for item in self.population_mechanisms],
-            "temporal_processes": [item.to_dict() for item in self.temporal_processes],
+            "shared_states": [item.to_dict() for item in self.shared_states],
+            "temporal_state_plans": [
+                item.to_dict() for item in self.temporal_state_plans
+            ],
+            "column_mechanisms": [
+                item.to_dict() for item in self.column_mechanisms
+            ],
+            "population_mechanisms": [
+                item.to_dict() for item in self.population_mechanisms
+            ],
+            "temporal_processes": [
+                item.to_dict() for item in self.temporal_processes
+            ],
         }
 
     @classmethod
@@ -415,6 +476,18 @@ class InstancePlan:
             )
             for item in data["relations"]
         )
+        shared_states = tuple(
+            SharedStatePlan.from_dict(item)
+            for item in data.get("shared_states", ())
+        )
+        shared_state_ids = tuple(data.get("shared_state_ids", ()))
+        if not shared_state_ids:
+            shared_state_ids = tuple(item.state_id for item in shared_states)
+        temporal_state_plans = tuple(
+            TemporalStatePlan.from_dict(item)
+            for item in data.get("temporal_state_plans", ())
+        )
+
         return cls(
             plan_id=data["plan_id"],
             sample_id=data["sample_id"],
@@ -430,8 +503,13 @@ class InstancePlan:
             prior_plan_id=data.get("prior_plan_id"),
             prior_family=data.get("prior_family", "legacy_role_scm"),
             motif_bundles=tuple(MotifMechanismBundle.from_dict(item) for item in data.get("motif_bundles", ())),
-            shared_state_ids=tuple(data.get("shared_state_ids", ())),
-            column_mechanisms=tuple(ColumnMechanismPlan.from_dict(item) for item in data.get("column_mechanisms", ())),
+            shared_state_ids=shared_state_ids,
+            shared_states=shared_states,
+            temporal_state_plans=temporal_state_plans,
+            column_mechanisms=tuple(
+                ColumnMechanismPlan.from_dict(item)
+                for item in data.get("column_mechanisms", ())
+            ),
             population_mechanisms=tuple(PopulationMechanismPlan.from_dict(item) for item in data.get("population_mechanisms", ())),
             temporal_processes=tuple(TemporalProcessPlan.from_dict(item) for item in data.get("temporal_processes", ())),
         )

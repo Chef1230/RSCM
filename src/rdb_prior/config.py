@@ -27,8 +27,14 @@ from rdb_prior.instance.plan import (
 )
 from rdb_prior.instance.planner import InstancePlannerConfig, RoleSCMPrior
 from rdb_prior.pipeline import InstancePipelineConfig, SchemaPipelineConfig
-from rdb_prior.priors.model import PriorFamily, TaskPolicyPlan
-from rdb_prior.priors.planner import PriorPlannerConfig
+from rdb_prior.priors.model import (
+    PriorFamily,
+    StateSpacePlan,
+    StateVisibility,
+    TaskPolicyPlan,
+    TransitionClock,
+)
+from rdb_prior.priors.planner import PriorPlannerConfig, TemporalStateConfig
 from rdb_prior.routing.config import (
     RoutedH5Config,
     RouterModelConfig,
@@ -193,6 +199,7 @@ def load_schema_pipeline_config(
             "path_router",
             "routed_h5",
             "prior",
+            "debug",
         },
         "config",
     )
@@ -619,7 +626,27 @@ _PRIOR_OPTIONS = {
     "database_family_weights",
     "task_policy",
     "state_dimension",
+    "shared_state",
+    "temporal_state",
 }
+
+_PRIOR_SHARED_STATE_OPTIONS = {"family", "dimension"}
+
+_PRIOR_TEMPORAL_STATE_OPTIONS = {
+    "enabled",
+    "state_space",
+    "initial_state",
+    "transition",
+    "duration",
+    "visibility",
+}
+
+_PRIOR_STATE_SPACE_OPTIONS = {"values", "terminal_states"}
+_PRIOR_INITIAL_STATE_OPTIONS = {"family"}
+_PRIOR_TRANSITION_OPTIONS = {"clock", "family"}
+_PRIOR_DURATION_OPTIONS = {"family", "state_conditioned"}
+_PRIOR_VISIBILITY_OPTIONS = {"family"}
+_DEBUG_OPTIONS = {"persist_private_state_trajectory"}
 
 _PRIOR_TASK_POLICY_OPTIONS = {
     "programs_per_database",
@@ -784,6 +811,7 @@ def load_instance_pipeline_config(
         _INSTANCE_GENERATION_OPTIONS,
     )
     prior_section = _section(root, "prior", _PRIOR_OPTIONS)
+    debug = _section(root, "debug", _DEBUG_OPTIONS)
     cli = overrides or InstanceConfigOverrides()
     if not isinstance(cli, InstanceConfigOverrides):
         raise TypeError("overrides must be InstanceConfigOverrides or None")
@@ -881,6 +909,9 @@ def load_instance_pipeline_config(
             ),
             planner=planner,
             prior=prior_config,
+            persist_private_state_trajectory=debug.get(
+                "persist_private_state_trajectory", False
+            ),
         )
     except (TypeError, ValueError) as error:
         raise SchemaConfigError(
@@ -1416,8 +1447,150 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
     return PriorPlannerConfig(
         database_family_weights=weights,
         task_policy=policy,
-        state_dimension=raw.get("state_dimension", 4),
+        state_dimension=_shared_state_config(raw)["dimension"],
+        shared_state_family=_shared_state_config(raw)["family"],
+        temporal_state=_temporal_state_config(
+            _mapping(raw.get("temporal_state", {}), "config.prior.temporal_state")
+        ),
     )
+
+
+def _shared_state_config(raw: Mapping[str, Any]) -> dict[str, Any]:
+    shared = _mapping(raw.get("shared_state", {}), "config.prior.shared_state")
+    _reject_unknown(
+        shared,
+        _PRIOR_SHARED_STATE_OPTIONS,
+        "config.prior.shared_state",
+    )
+    if "state_dimension" in raw and "dimension" in shared:
+        raise SchemaConfigError(
+            "config.prior cannot set both state_dimension and shared_state.dimension"
+        )
+    return {
+        "family": shared.get("family", "gaussian_mixture"),
+        "dimension": shared.get("dimension", raw.get("state_dimension", 4)),
+    }
+
+
+def _temporal_state_config(raw: Mapping[str, Any]) -> TemporalStateConfig:
+    """Parse the deliberately small, explicit PR4 temporal-state surface."""
+    _reject_unknown(
+        raw,
+        _PRIOR_TEMPORAL_STATE_OPTIONS,
+        "config.prior.temporal_state",
+    )
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise SchemaConfigError(
+            "config.prior.temporal_state.enabled must be a boolean"
+        )
+    if not enabled:
+        conflicting = sorted(set(raw) - {"enabled"})
+        if conflicting:
+            raise SchemaConfigError(
+                "disabled config.prior.temporal_state cannot set: "
+                + ", ".join(conflicting)
+            )
+        return TemporalStateConfig()
+
+    required = {
+        "state_space",
+        "initial_state",
+        "transition",
+        "duration",
+        "visibility",
+    }
+    missing = sorted(required - set(raw))
+    if missing:
+        raise SchemaConfigError(
+            "enabled config.prior.temporal_state requires: "
+            + ", ".join(missing)
+        )
+    state_space = _mapping(
+        raw["state_space"],
+        "config.prior.temporal_state.state_space",
+    )
+    _reject_unknown(
+        state_space,
+        _PRIOR_STATE_SPACE_OPTIONS,
+        "config.prior.temporal_state.state_space",
+    )
+    if "values" not in state_space:
+        raise SchemaConfigError(
+            "config.prior.temporal_state.state_space requires values"
+        )
+    initial = _mapping(
+        raw["initial_state"],
+        "config.prior.temporal_state.initial_state",
+    )
+    transition = _mapping(
+        raw["transition"],
+        "config.prior.temporal_state.transition",
+    )
+    duration = _mapping(
+        raw["duration"],
+        "config.prior.temporal_state.duration",
+    )
+    visibility = _mapping(
+        raw["visibility"],
+        "config.prior.temporal_state.visibility",
+    )
+    _reject_unknown(
+        initial,
+        _PRIOR_INITIAL_STATE_OPTIONS,
+        "config.prior.temporal_state.initial_state",
+    )
+    _reject_unknown(
+        transition,
+        _PRIOR_TRANSITION_OPTIONS,
+        "config.prior.temporal_state.transition",
+    )
+    _reject_unknown(
+        duration,
+        _PRIOR_DURATION_OPTIONS,
+        "config.prior.temporal_state.duration",
+    )
+    _reject_unknown(
+        visibility,
+        _PRIOR_VISIBILITY_OPTIONS,
+        "config.prior.temporal_state.visibility",
+    )
+    for path, section, keys in (
+        ("initial_state", initial, {"family"}),
+        ("transition", transition, {"clock", "family"}),
+        ("duration", duration, {"family"}),
+        ("visibility", visibility, {"family"}),
+    ):
+        missing = sorted(keys - set(section))
+        if missing:
+            raise SchemaConfigError(
+                f"config.prior.temporal_state.{path} requires: "
+                + ", ".join(missing)
+            )
+    try:
+        return TemporalStateConfig(
+            enabled=True,
+            state_space=StateSpacePlan(
+                values=_string_tuple(
+                    state_space["values"],
+                    "config.prior.temporal_state.state_space.values",
+                ),
+                terminal_states=_string_tuple(
+                    state_space.get("terminal_states", ()),
+                    "config.prior.temporal_state.state_space.terminal_states",
+                ),
+            ),
+            initial_family=initial["family"],
+            transition_clock=TransitionClock(transition["clock"]),
+            transition_family=transition["family"],
+            duration_family=duration["family"],
+            duration_state_conditioned=duration.get("state_conditioned", True),
+            visibility=StateVisibility(visibility["family"]),
+        )
+    except (TypeError, ValueError) as error:
+        raise SchemaConfigError(
+            f"Invalid config.prior.temporal_state: {error}"
+        ) from error
 
 
 # Project-wide default template. Every loaded config is deep-merged on top

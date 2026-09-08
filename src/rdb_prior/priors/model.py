@@ -18,6 +18,184 @@ class PriorFamily(str, Enum):
     RULE_PROCESS = "rule_process"
 
 
+
+
+class StateVisibility(str, Enum):
+    """How a temporal state may affect ordinary generated data."""
+
+    HIDDEN = "hidden"
+    EVENT_EMISSION = "event_emission"
+
+
+class TransitionClock(str, Enum):
+    """Clock which causes a temporal-state transition."""
+
+    EVENT_DRIVEN = "event_driven"
+    DURATION_DRIVEN = "duration_driven"
+    HYBRID = "hybrid"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StateSpacePlan:
+    values: tuple[str, ...]
+    terminal_states: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, tuple) or len(self.values) < 2:
+            raise ValueError("state-space values must contain at least two states")
+        for value in self.values:
+            _identifier("state value", value)
+        if len(set(self.values)) != len(self.values):
+            raise ValueError("state-space values must be unique")
+        if not isinstance(self.terminal_states, tuple):
+            raise TypeError("terminal_states must be a tuple")
+        for value in self.terminal_states:
+            _identifier("terminal state", value)
+        if len(set(self.terminal_states)) != len(self.terminal_states):
+            raise ValueError("terminal_states must be unique")
+        if not set(self.terminal_states).issubset(self.values):
+            raise ValueError("terminal_states must belong to state-space values")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "values": list(self.values),
+            "terminal_states": list(self.terminal_states),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "StateSpacePlan":
+        return cls(
+            values=tuple(data["values"]),
+            terminal_states=tuple(data.get("terminal_states", ())),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TransitionMechanismPlan:
+    clock: TransitionClock
+    family: str
+    seed: int
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.clock, TransitionClock):
+            raise TypeError("clock must be TransitionClock")
+        _identifier("transition family", self.family)
+        _seed("transition seed", self.seed)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "clock": self.clock.value,
+            "family": self.family,
+            "seed": self.seed,
+            "parameters": dict(self.parameters),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TransitionMechanismPlan":
+        return cls(
+            clock=TransitionClock(data["clock"]),
+            family=data["family"],
+            seed=data["seed"],
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DurationMechanismPlan:
+    family: str
+    state_conditioned: bool
+    seed: int
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("duration family", self.family)
+        if not isinstance(self.state_conditioned, bool):
+            raise TypeError("state_conditioned must be a bool")
+        _seed("duration seed", self.seed)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "family": self.family,
+            "state_conditioned": self.state_conditioned,
+            "seed": self.seed,
+            "parameters": dict(self.parameters),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DurationMechanismPlan":
+        return cls(
+            family=data["family"],
+            state_conditioned=data["state_conditioned"],
+            seed=data["seed"],
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TemporalStatePlan:
+    """One entity-scoped state process; static and temporal state stay distinct."""
+
+    state_id: str
+    owner_table_id: str
+    shared_state_id: str
+    state_space: StateSpacePlan
+    initial_family: str
+    initial_parameters: tuple[tuple[str, object], ...]
+    transition: TransitionMechanismPlan
+    duration: DurationMechanismPlan
+    visibility: StateVisibility
+    seed: int
+
+    def __post_init__(self) -> None:
+        for name in ("state_id", "owner_table_id", "shared_state_id", "initial_family"):
+            _identifier(name, getattr(self, name))
+        if not isinstance(self.state_space, StateSpacePlan):
+            raise TypeError("state_space must be StateSpacePlan")
+        object.__setattr__(
+            self,
+            "initial_parameters",
+            _parameters(self.initial_parameters),
+        )
+        if not isinstance(self.transition, TransitionMechanismPlan):
+            raise TypeError("transition must be TransitionMechanismPlan")
+        if not isinstance(self.duration, DurationMechanismPlan):
+            raise TypeError("duration must be DurationMechanismPlan")
+        if not isinstance(self.visibility, StateVisibility):
+            raise TypeError("visibility must be StateVisibility")
+        _seed("temporal state seed", self.seed)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state_id": self.state_id,
+            "owner_table_id": self.owner_table_id,
+            "shared_state_id": self.shared_state_id,
+            "state_space": self.state_space.to_dict(),
+            "initial_family": self.initial_family,
+            "initial_parameters": dict(self.initial_parameters),
+            "transition": self.transition.to_dict(),
+            "duration": self.duration.to_dict(),
+            "visibility": self.visibility.value,
+            "seed": self.seed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TemporalStatePlan":
+        return cls(
+            state_id=data["state_id"],
+            owner_table_id=data["owner_table_id"],
+            shared_state_id=data["shared_state_id"],
+            state_space=StateSpacePlan.from_dict(data["state_space"]),
+            initial_family=data["initial_family"],
+            initial_parameters=tuple(data.get("initial_parameters", {}).items()),
+            transition=TransitionMechanismPlan.from_dict(data["transition"]),
+            duration=DurationMechanismPlan.from_dict(data["duration"]),
+            visibility=StateVisibility(data["visibility"]),
+            seed=data["seed"],
+        )
+
 def _identifier(name: str, value: object) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
@@ -185,6 +363,7 @@ class DatabasePriorPlan:
     motif_bundles: tuple[MotifMechanismBundle, ...]
     task_policy: TaskPolicyPlan
     seed: int
+    temporal_states: tuple[TemporalStatePlan, ...] = ()
 
     def __post_init__(self) -> None:
         _identifier("plan_id", self.plan_id)
@@ -195,6 +374,11 @@ class DatabasePriorPlan:
             raise TypeError("semantic_schema must be SemanticSchemaPlan")
         if not isinstance(self.shared_states, tuple) or not all(isinstance(item, SharedStatePlan) for item in self.shared_states):
             raise TypeError("shared_states must contain SharedStatePlan values")
+        if not isinstance(self.temporal_states, tuple) or not all(
+            isinstance(item, TemporalStatePlan) for item in self.temporal_states
+        ):
+            raise TypeError("temporal_states must contain TemporalStatePlan values")
+
         if not isinstance(self.motif_bundles, tuple) or not all(isinstance(item, MotifMechanismBundle) for item in self.motif_bundles):
             raise TypeError("motif_bundles must contain MotifMechanismBundle values")
         if not isinstance(self.task_policy, TaskPolicyPlan):
@@ -202,6 +386,14 @@ class DatabasePriorPlan:
         _seed("seed", self.seed)
         if len({item.state_id for item in self.shared_states}) != len(self.shared_states):
             raise ValueError("shared state IDs must be unique")
+        if len({item.state_id for item in self.temporal_states}) != len(
+            self.temporal_states
+        ):
+            raise ValueError("temporal state IDs must be unique")
+        known_shared = {item.state_id for item in self.shared_states}
+        if any(item.shared_state_id not in known_shared for item in self.temporal_states):
+            raise ValueError("temporal states must reference shared states")
+
         if len({item.bundle_id for item in self.motif_bundles}) != len(self.motif_bundles):
             raise ValueError("bundle IDs must be unique")
 
@@ -209,11 +401,54 @@ class DatabasePriorPlan:
         return next(item for item in self.motif_bundles if item.bundle_id == bundle_id)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"plan_id": self.plan_id, "family": self.family.value, "family_version": self.family_version, "semantic_schema": self.semantic_schema.to_dict(), "shared_states": [item.to_dict() for item in self.shared_states], "motif_bundles": [item.to_dict() for item in self.motif_bundles], "task_policy": self.task_policy.to_dict(), "seed": self.seed}
+        return {
+            "plan_id": self.plan_id,
+            "family": self.family.value,
+            "family_version": self.family_version,
+            "semantic_schema": self.semantic_schema.to_dict(),
+            "shared_states": [item.to_dict() for item in self.shared_states],
+            "temporal_states": [item.to_dict() for item in self.temporal_states],
+            "motif_bundles": [item.to_dict() for item in self.motif_bundles],
+            "task_policy": self.task_policy.to_dict(),
+            "seed": self.seed,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "DatabasePriorPlan":
-        return cls(plan_id=data["plan_id"], family=PriorFamily(data["family"]), family_version=data["family_version"], semantic_schema=SemanticSchemaPlan.from_dict(data["semantic_schema"]), shared_states=tuple(SharedStatePlan.from_dict(item) for item in data.get("shared_states", ())), motif_bundles=tuple(MotifMechanismBundle.from_dict(item) for item in data.get("motif_bundles", ())), task_policy=TaskPolicyPlan.from_dict(data.get("task_policy", {})), seed=data["seed"])
+        return cls(
+            plan_id=data["plan_id"],
+            family=PriorFamily(data["family"]),
+            family_version=data["family_version"],
+            semantic_schema=SemanticSchemaPlan.from_dict(data["semantic_schema"]),
+            shared_states=tuple(
+                SharedStatePlan.from_dict(item)
+                for item in data.get("shared_states", ())
+            ),
+            motif_bundles=tuple(
+                MotifMechanismBundle.from_dict(item)
+                for item in data.get("motif_bundles", ())
+            ),
+            task_policy=TaskPolicyPlan.from_dict(data.get("task_policy", {})),
+            seed=data["seed"],
+            temporal_states=tuple(
+                TemporalStatePlan.from_dict(item)
+                for item in data.get("temporal_states", ())
+            ),
+        )
 
 
-__all__ = ["PriorFamily", "SharedStatePlan", "TableMechanismBinding", "RelationMechanismBinding", "MotifMechanismBundle", "TaskPolicyPlan", "DatabasePriorPlan"]
+__all__ = [
+    "PriorFamily",
+    "StateVisibility",
+    "TransitionClock",
+    "StateSpacePlan",
+    "TransitionMechanismPlan",
+    "DurationMechanismPlan",
+    "TemporalStatePlan",
+    "SharedStatePlan",
+    "TableMechanismBinding",
+    "RelationMechanismBinding",
+    "MotifMechanismBundle",
+    "TaskPolicyPlan",
+    "DatabasePriorPlan",
+]

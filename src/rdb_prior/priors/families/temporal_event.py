@@ -48,6 +48,10 @@ def bind_temporal_event_plan(
         entity_id = str(parameters["entity_table_id"])
         event_id = str(parameters["event_table_id"])
         state_id = str(parameters["state_id"])
+        temporal_state_id = (
+            str(parameters["temporal_state_id"])
+            if "temporal_state_id" in parameters else None
+        )
         foreign_key_id = bundle.edge_bindings[0].foreign_key_id
         entity_latent = latents.table(entity_id).values
         old_table = table_plans[event_id]
@@ -96,6 +100,9 @@ def bind_temporal_event_plan(
                 table_id=event_id,
                 family=str(time_family),
                 state_ids=(state_id,),
+                temporal_state_ids=(
+                    () if temporal_state_id is None else (temporal_state_id,)
+                ),
                 parameters=(("foreign_key_id", foreign_key_id), ("seasonal_strength", float(rng.uniform(0.25, 0.75))), ("churn_exponent", float(rng.uniform(1.25, 3.0)))),
             )
         )
@@ -122,6 +129,8 @@ def bind_temporal_event_plan(
         prior_family=prior_plan.family.value,
         motif_bundles=prior_plan.motif_bundles,
         shared_state_ids=tuple(item.state_id for item in prior_plan.shared_states),
+        shared_states=prior_plan.shared_states,
+        temporal_state_plans=prior_plan.temporal_states,
         population_mechanisms=tuple(population_mechanisms),
         temporal_processes=tuple(temporal_processes),
         column_mechanisms=tuple(column_mechanisms),

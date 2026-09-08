@@ -203,6 +203,7 @@ class InstancePipelineConfig:
     project_version: str = "instance-pipeline-v1"
     planner: InstancePlannerConfig = InstancePlannerConfig()
     prior: PriorPlannerConfig | None = None
+    persist_private_state_trajectory: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.schema_manifest, Path):
@@ -237,6 +238,8 @@ class InstancePipelineConfig:
             raise TypeError("planner must be InstancePlannerConfig")
         if self.prior is not None and not isinstance(self.prior, PriorPlannerConfig):
             raise TypeError("prior must be PriorPlannerConfig or None")
+        if not isinstance(self.persist_private_state_trajectory, bool):
+            raise TypeError("persist_private_state_trajectory must be a boolean")
 
     def to_dict(self) -> dict[str, object]:
         planner = self.planner
@@ -250,6 +253,11 @@ class InstancePipelineConfig:
             "overwrite": self.overwrite,
             "progress_every": self.progress_every,
             "project_version": self.project_version,
+            "debug": {
+                "persist_private_state_trajectory": (
+                    self.persist_private_state_trajectory
+                ),
+            },
             "planner": {
                 name: getattr(planner, name)
                 for name in planner.__dataclass_fields__
@@ -304,6 +312,34 @@ class InstancePipelineConfig:
                         ],
                         "task_policy": self.prior.task_policy.to_dict(),
                         "state_dimension": self.prior.state_dimension,
+                        "shared_state": {
+                            "family": self.prior.shared_state_family,
+                            "dimension": self.prior.state_dimension,
+                        },
+                        "temporal_state": {
+                            "enabled": self.prior.temporal_state.enabled,
+                            "state_space": (
+                                None
+                                if self.prior.temporal_state.state_space is None
+                                else self.prior.temporal_state.state_space.to_dict()
+                            ),
+                            "initial_state": {
+                                "family": self.prior.temporal_state.initial_family,
+                            },
+                            "transition": {
+                                "clock": self.prior.temporal_state.transition_clock.value,
+                                "family": self.prior.temporal_state.transition_family,
+                            },
+                            "duration": {
+                                "family": self.prior.temporal_state.duration_family,
+                                "state_conditioned": (
+                                    self.prior.temporal_state.duration_state_conditioned
+                                ),
+                            },
+                            "visibility": {
+                                "family": self.prior.temporal_state.visibility.value,
+                            },
+                        },
                     }
                 ),
             },
@@ -331,6 +367,7 @@ class _InstanceWorkItem:
     overwrite: bool
     project_version: str
     config_digest: str
+    persist_private_state_trajectory: bool
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -571,6 +608,9 @@ def generate_database_instances(
                 overwrite=config.overwrite,
                 project_version=config.project_version,
                 config_digest=config_digest,
+                persist_private_state_trajectory=(
+                    config.persist_private_state_trajectory
+                ),
             )
         )
     _LOGGER.info(
@@ -755,6 +795,11 @@ def _generate_one_database_instance(
         report=report,
         prior_plan=prior_plan,
         task_programs=task_programs,
+        temporal_state_registry=(
+            materialization.temporal_state_registry
+            if item.persist_private_state_trajectory
+            else None
+        ),
     )
     row_count = sum(table.row_count for table in database.tables)
     return _InstanceWorkResult(

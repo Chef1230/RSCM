@@ -12,7 +12,11 @@ from rdb_prior.generation.features import generate_table_features
 from rdb_prior.generation.latent import generate_latent_registry
 from rdb_prior.generation.model import DatabaseInstance, TableData
 from rdb_prior.generation.relations import generate_relations
-from rdb_prior.generation.temporal_processes import apply_temporal_event_processes
+from rdb_prior.generation.state_trajectory import TemporalStateRegistry
+from rdb_prior.generation.temporal_processes import (
+    TemporalEventMaterialization,
+    apply_temporal_event_processes,
+)
 from rdb_prior.instance.plan import InstancePlan
 
 
@@ -22,6 +26,7 @@ class DatabaseMaterialization:
 
     plan: InstancePlan
     database: DatabaseInstance
+    temporal_state_registry: TemporalStateRegistry | None = None
 
 
 class DatabaseGenerator:
@@ -38,7 +43,9 @@ class DatabaseGenerator:
         *,
         schema: PhysicalSchema,
         plan: InstancePlan,
-    ) -> DatabaseInstance:
+        apply_temporal: bool = True,
+        include_private_state: bool = False,
+    ) -> DatabaseInstance | TemporalEventMaterialization:
         if schema.schema_id != plan.schema_id:
             raise ValueError("instance plan does not belong to physical schema")
         latents = generate_latent_registry(plan)
@@ -82,7 +89,14 @@ class DatabaseGenerator:
             plan_id=plan.plan_id,
             tables=tuple(generated.values()),
         )
-        return apply_temporal_event_processes(schema, plan, database)
+        if not apply_temporal:
+            return database
+        return apply_temporal_event_processes(
+            schema,
+            plan,
+            database,
+            include_private_state=include_private_state,
+        )
 
     def materialize(
         self,
@@ -96,16 +110,24 @@ class DatabaseGenerator:
         draft to obtain Entity attributes, resolve state+attribute-conditioned
         Event counts, then materialize that final immutable plan.
         """
-        if not requires_finalization(plan):
-            return DatabaseMaterialization(
+        if requires_finalization(plan):
+            draft = self._generate_once(
+                schema=schema,
                 plan=plan,
-                database=self._generate_once(schema=schema, plan=plan),
+                apply_temporal=False,
             )
-        draft = self._generate_once(schema=schema, plan=plan)
-        final_plan = finalize_plan(schema, plan, draft)
+            assert isinstance(draft, DatabaseInstance)
+            plan = finalize_plan(schema, plan, draft)
+        generated = self._generate_once(
+            schema=schema,
+            plan=plan,
+            include_private_state=True,
+        )
+        assert isinstance(generated, TemporalEventMaterialization)
         return DatabaseMaterialization(
-            plan=final_plan,
-            database=self._generate_once(schema=schema, plan=final_plan),
+            plan=plan,
+            database=generated.database,
+            temporal_state_registry=generated.temporal_states,
         )
 
 

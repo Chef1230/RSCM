@@ -19,6 +19,7 @@ from rdb_prior.compilation.model import (
 )
 from rdb_prior.runtime import RuntimeRecord
 from rdb_prior.generation.model import DatabaseInstance, TableData
+from rdb_prior.generation.state_trajectory import TemporalStateRegistry
 from rdb_prior.instance.plan import InstancePlan
 from rdb_prior.priors.model import DatabasePriorPlan
 from rdb_prior.schema.blueprint import SchemaBlueprint
@@ -241,6 +242,7 @@ class InstanceArtifactWriter:
         report: InstanceValidationReport,
         prior_plan: DatabasePriorPlan | None = None,
         task_programs: tuple[TaskProgramPlan, ...] = (),
+        temporal_state_registry: TemporalStateRegistry | None = None,
     ) -> Path:
         if not _ARTIFACT_ID.fullmatch(sample_id):
             raise ValueError("sample_id is not artifact-safe")
@@ -268,6 +270,11 @@ class InstanceArtifactWriter:
                     temporary / "task_programs.json",
                     {"programs": [item.to_dict() for item in task_programs]},
                 )
+            if temporal_state_registry is not None:
+                _write_json_file(
+                    temporary / "temporal_state_trajectory.json",
+                    temporal_state_registry.to_dict(),
+                )
             _write_json_file(temporary / "runtime.json", runtime.to_dict())
             _write_json_file(temporary / "validation.json", report.to_dict())
             table_entries: list[dict[str, Any]] = []
@@ -292,7 +299,7 @@ class InstanceArtifactWriter:
                 temporary / "artifact.json",
                 {
                     "artifact_type": "database_instance",
-                    "artifact_version": 2,
+                    "artifact_version": 3,
                     "sample_id": sample_id,
                     "instance_id": database.instance_id,
                     "schema_id": schema.schema_id,
@@ -306,6 +313,10 @@ class InstanceArtifactWriter:
                     ),
                     "task_programs": (
                         None if not task_programs else "task_programs.json"
+                    ),
+                    "temporal_state_trajectory": (
+                        None if temporal_state_registry is None
+                        else "temporal_state_trajectory.json"
                     ),
                     "tables": table_entries,
                 },
@@ -355,6 +366,7 @@ class InstanceArtifact:
     validation: InstanceValidationReport
     prior_plan: DatabasePriorPlan | None = None
     task_programs: tuple[TaskProgramPlan, ...] = ()
+    temporal_state_registry: TemporalStateRegistry | None = None
 
 
 def load_instance_artifact(path: str | Path) -> InstanceArtifact:
@@ -362,7 +374,7 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     if payload.get("artifact_type") != "database_instance":
         raise ValueError("unsupported instance artifact type")
-    if payload.get("artifact_version") not in {1, 2}:
+    if payload.get("artifact_version") not in {1, 2, 3}:
         raise ValueError("unsupported instance artifact version")
     root = manifest_path.parent
     plan = InstancePlan.from_dict(
@@ -396,6 +408,15 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
     if programs_file is not None:
         program_payload = json.loads((root / programs_file).read_text(encoding="utf-8"))
         task_programs = tuple(TaskProgramPlan.from_dict(item) for item in program_payload.get("programs", ()))
+    trajectory_file = payload.get("temporal_state_trajectory")
+    temporal_state_registry = (
+        None
+        if trajectory_file is None
+        else TemporalStateRegistry.from_dict(
+            json.loads((root / trajectory_file).read_text(encoding="utf-8"))
+        )
+    )
+
     return InstanceArtifact(
         sample_id=payload["sample_id"],
         schema_artifact=payload["schema_artifact"],
@@ -405,6 +426,7 @@ def load_instance_artifact(path: str | Path) -> InstanceArtifact:
         validation=validation,
         prior_plan=prior_plan,
         task_programs=task_programs,
+        temporal_state_registry=temporal_state_registry,
     )
 
 
