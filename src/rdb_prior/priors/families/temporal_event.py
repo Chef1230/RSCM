@@ -16,10 +16,15 @@ from rdb_prior.instance.plan import (
     PopulationPlan,
     TemporalProcessPlan,
 )
-from rdb_prior.priors.model import DatabasePriorPlan, PriorFamily
+from rdb_prior.priors.model import (
+    AttributePriorKind,
+    DatabasePriorPlan,
+    PriorFamily,
+    RelationPriorKind,
+    TemporalPriorKind,
+)
 
 
-_TIME_FAMILIES = ("stationary", "seasonal", "churn", "renewal")
 _ATTRIBUTE_FAMILIES = ("linear", "cam")
 
 
@@ -49,6 +54,21 @@ def bind_temporal_event_plan(
     for bundle in prior_plan.motif_bundles:
         if bundle.family is not PriorFamily.TEMPORAL_EVENT:
             continue
+        if bundle.attribute_mechanism.kind != AttributePriorKind.COLUMN_SCM.value:
+            raise ValueError(
+                "temporal_event/v1 only executes column_scm attributes; "
+                "tree and rule attributes require their own executor"
+            )
+        if (
+            bundle.relation_mechanism.kind
+            != RelationPriorKind.STATE_CONDITIONED_EVENT.value
+        ):
+            raise ValueError(
+                "temporal_event/v1 only executes state_conditioned_event relations"
+            )
+        temporal_kind = TemporalPriorKind(bundle.temporal_mechanism.kind)
+        if temporal_kind is TemporalPriorKind.STATIC:
+            raise ValueError("temporal_event/v1 requires a non-static temporal mechanism")
         parameters = dict(bundle.parameters)
         entity_id = str(parameters["entity_table_id"])
         event_id = str(parameters["event_table_id"])
@@ -103,7 +123,7 @@ def bind_temporal_event_plan(
                 ),
             )
         )
-        time_family = rng.choice(_TIME_FAMILIES)
+        time_family = temporal_kind.value
         temporal_processes.append(
             TemporalProcessPlan(
                 table_id=event_id,
@@ -160,6 +180,7 @@ def bind_temporal_event_plan(
         plan,
         tables=tuple(table_plans[table_id] for table_id in plan.generation_order),
         prior_plan_id=prior_plan.plan_id,
+        prior_composition_id=prior_plan.composition.plan_id,
         prior_family=prior_plan.family.value,
         motif_bundles=prior_plan.motif_bundles,
         shared_state_ids=tuple(item.state_id for item in prior_plan.shared_states),

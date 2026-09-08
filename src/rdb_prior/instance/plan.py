@@ -260,6 +260,7 @@ class InstancePlan:
     calendar_start_seconds: int | None = None
     calendar_end_seconds: int | None = None
     prior_plan_id: str | None = None
+    prior_composition_id: str | None = None
     prior_family: str = "legacy_role_scm"
     motif_bundles: tuple[MotifMechanismBundle, ...] = ()
     shared_state_ids: tuple[str, ...] = ()
@@ -316,6 +317,8 @@ class InstancePlan:
             )
         if self.prior_plan_id is not None:
             _identifier("prior_plan_id", self.prior_plan_id)
+        if self.prior_composition_id is not None:
+            _identifier("prior_composition_id", self.prior_composition_id)
         _identifier("prior_family", self.prior_family)
         if not isinstance(self.motif_bundles, tuple) or not all(
             isinstance(item, MotifMechanismBundle) for item in self.motif_bundles
@@ -414,6 +417,7 @@ class InstancePlan:
             "calendar_start_seconds": self.calendar_start_seconds,
             "calendar_end_seconds": self.calendar_end_seconds,
             "prior_plan_id": self.prior_plan_id,
+            "prior_composition_id": self.prior_composition_id,
             "prior_family": self.prior_family,
             "motif_bundles": [item.to_dict() for item in self.motif_bundles],
             "shared_state_ids": list(self.shared_state_ids),
@@ -501,6 +505,7 @@ class InstancePlan:
             calendar_start_seconds=data.get("calendar_start_seconds"),
             calendar_end_seconds=data.get("calendar_end_seconds"),
             prior_plan_id=data.get("prior_plan_id"),
+            prior_composition_id=data.get("prior_composition_id"),
             prior_family=data.get("prior_family", "legacy_role_scm"),
             motif_bundles=tuple(MotifMechanismBundle.from_dict(item) for item in data.get("motif_bundles", ())),
             shared_state_ids=shared_state_ids,

@@ -9,21 +9,28 @@ import numpy as np
 from rdb_prior.compilation.model import PhysicalSchema
 from rdb_prior.priors.compatibility import entity_event_candidates
 from rdb_prior.priors.model import (
+    AttributePriorKind,
     DatabasePriorPlan,
     DurationMechanismPlan,
     MotifMechanismBundle,
+    NuisancePlan,
+    NuisancePriorKind,
+    PriorCompositionPlan,
     PriorFamily,
+    ProcessPriorKind,
     RelationMechanismBinding,
+    RelationPriorKind,
     SharedStatePlan,
     StateSpacePlan,
     StateVisibility,
     TableMechanismBinding,
     TaskPolicyPlan,
+    TemporalPriorKind,
     TemporalStatePlan,
     TransitionClock,
     TransitionMechanismPlan,
 )
-from rdb_prior.priors.registry import descriptor, is_implemented
+from rdb_prior.priors.registry import descriptor, is_implemented, mechanism_ref
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.blueprint import SchemaBlueprint
 from rdb_prior.schema.semantics import SemanticSchemaPlan
@@ -68,6 +75,43 @@ class TemporalStateConfig:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class PriorCompositionConfig:
+    """One database-level selection for every independent prior axis."""
+
+    attribute: AttributePriorKind
+    relation: RelationPriorKind
+    temporal: TemporalPriorKind
+    process: ProcessPriorKind = ProcessPriorKind.NONE
+    nuisance: NuisancePriorKind = NuisancePriorKind.LEGACY
+
+    def __post_init__(self) -> None:
+        for name, expected in (
+            ("attribute", AttributePriorKind),
+            ("relation", RelationPriorKind),
+            ("temporal", TemporalPriorKind),
+            ("process", ProcessPriorKind),
+            ("nuisance", NuisancePriorKind),
+        ):
+            if not isinstance(getattr(self, name), expected):
+                raise TypeError(f"{name} must be {expected.__name__}")
+        if (
+            self.relation is RelationPriorKind.STATE_CONDITIONED_EVENT
+            and self.temporal is TemporalPriorKind.STATIC
+        ):
+            raise ValueError(
+                "state_conditioned_event relation requires a temporal prior"
+            )
+        if (
+            self.process
+            in {ProcessPriorKind.STATE_MACHINE, ProcessPriorKind.WORKFLOW}
+            and self.temporal is TemporalPriorKind.STATIC
+        ):
+            raise ValueError(
+                "state-machine and workflow processes require a temporal prior"
+            )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PriorPlannerConfig:
     # No ``prior`` config must be byte-for-byte legacy in its seed path.
     database_family_weights: tuple[tuple[PriorFamily, float], ...] = ((PriorFamily.LEGACY_ROLE_SCM, 1.0),)
@@ -75,6 +119,7 @@ class PriorPlannerConfig:
     state_dimension: int = 4
     shared_state_family: str = "gaussian_mixture"
     temporal_state: TemporalStateConfig = TemporalStateConfig()
+    composition: PriorCompositionConfig | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.database_family_weights, tuple) or not self.database_family_weights:
@@ -98,7 +143,18 @@ class PriorPlannerConfig:
             raise ValueError("unsupported shared-state family")
         if not isinstance(self.temporal_state, TemporalStateConfig):
             raise TypeError("temporal_state must be TemporalStateConfig")
-        if self.temporal_state.enabled and not any(
+        if (
+            self.composition is not None
+            and not isinstance(self.composition, PriorCompositionConfig)
+        ):
+            raise TypeError("composition must be PriorCompositionConfig or None")
+        if (
+            self.temporal_state.enabled
+            and self.composition is not None
+            and self.composition.temporal is TemporalPriorKind.STATIC
+        ):
+            raise ValueError("temporal state requires a non-static composition")
+        if self.temporal_state.enabled and self.composition is None and not any(
             family is PriorFamily.TEMPORAL_EVENT and weight > 0
             for family, weight in self.database_family_weights
         ):
@@ -123,7 +179,19 @@ class PriorPlanner:
         if semantic_schema.schema_id != physical_schema.schema_id:
             raise ValueError("semantic schema does not belong to physical schema")
         candidates = entity_event_candidates(blueprint, physical_schema)
-        family = self._family(runtime, bool(candidates))
+        if self.config.composition is None:
+            family = self._family(runtime, bool(candidates))
+            components = self._default_composition(family, runtime)
+        else:
+            components = self.config.composition
+            if components.temporal is TemporalPriorKind.STATIC:
+                family = PriorFamily.LEGACY_ROLE_SCM
+            elif candidates:
+                family = PriorFamily.TEMPORAL_EVENT
+            else:
+                raise ValueError(
+                    "a non-static compositional temporal prior requires an entity-event motif"
+                )
         bundles: list[MotifMechanismBundle] = []
         states: list[SharedStatePlan] = []
         temporal_states: list[TemporalStatePlan] = []
@@ -167,18 +235,34 @@ class PriorPlanner:
                     foreign_key_id=candidate.foreign_key_id,
                     shared_state_id=state_id,
                     temporal_state_id=temporal_state_id,
+                    components=components,
                 )
             )
+        plan_id = f"prior_plan_{physical_schema.schema_id}"
+        seed = runtime.seed("prior", "global")
+        composition = PriorCompositionPlan(
+            plan_id=plan_id,
+            semantic_schema=semantic_schema,
+            shared_states=tuple(states),
+            temporal_states=tuple(temporal_states),
+            motif_bundles=tuple(bundles),
+            nuisance_plan=NuisancePlan(
+                mechanism=mechanism_ref(components.nuisance)
+            ),
+            task_policy=self.config.task_policy,
+            seed=seed,
+        )
         return DatabasePriorPlan(
-            plan_id=f"prior_plan_{physical_schema.schema_id}",
+            plan_id=plan_id,
             family=family,
             family_version=descriptor(family).version,
             semantic_schema=semantic_schema,
             shared_states=tuple(states),
             motif_bundles=tuple(bundles),
             task_policy=self.config.task_policy,
-            seed=runtime.seed("prior", "global"),
+            seed=seed,
             temporal_states=tuple(temporal_states),
+            composition=composition,
         )
 
     def _family(
@@ -204,6 +288,33 @@ class PriorPlanner:
             k=1,
         )[0]
 
+    def _default_composition(
+        self,
+        family: PriorFamily,
+        runtime: RuntimeContext,
+    ) -> PriorCompositionConfig:
+        if family is PriorFamily.TEMPORAL_EVENT:
+            temporal = runtime.python_rng(
+                "prior", "temporal-component"
+            ).choice(
+                (
+                    TemporalPriorKind.STATIONARY,
+                    TemporalPriorKind.SEASONAL,
+                    TemporalPriorKind.CHURN,
+                    TemporalPriorKind.RENEWAL,
+                )
+            )
+            return PriorCompositionConfig(
+                attribute=AttributePriorKind.COLUMN_SCM,
+                relation=RelationPriorKind.STATE_CONDITIONED_EVENT,
+                temporal=temporal,
+            )
+        return PriorCompositionConfig(
+            attribute=AttributePriorKind.LEGACY_SCM,
+            relation=RelationPriorKind.LATENT_AFFINITY,
+            temporal=TemporalPriorKind.STATIC,
+        )
+
     def _legacy_bundle(self, occurrence: object) -> MotifMechanismBundle:
         node_bindings = tuple(
             TableMechanismBinding(
@@ -219,8 +330,10 @@ class PriorPlanner:
             node_bindings=node_bindings,
             edge_bindings=(),
             population_mechanism="legacy",
-            temporal_mechanism="legacy",
-            attribute_mechanism="legacy",
+            attribute_mechanism=mechanism_ref(AttributePriorKind.LEGACY_SCM),
+            relation_mechanism=mechanism_ref(RelationPriorKind.LATENT_AFFINITY),
+            temporal_mechanism=mechanism_ref(TemporalPriorKind.STATIC),
+            process_mechanism=mechanism_ref(ProcessPriorKind.NONE),
             compatible_task_families=(),
         )
 
@@ -233,6 +346,7 @@ class PriorPlanner:
         foreign_key_id: str,
         shared_state_id: str,
         temporal_state_id: str | None,
+        components: PriorCompositionConfig,
     ) -> MotifMechanismBundle:
         parameters: tuple[tuple[str, object], ...] = (
             ("entity_table_id", entity_table_id),
@@ -241,12 +355,17 @@ class PriorPlanner:
         )
         entity_mechanisms = (shared_state_id, "entity_state")
         event_mechanisms = ("event_count", "event_time", "event_attributes")
-        temporal_mechanism = "sampled_stationary_seasonal_churn"
+        temporal_parameters: tuple[tuple[str, object], ...] = (
+            ("selection", components.temporal.value),
+        )
+        process = components.process
         if temporal_state_id is not None:
             parameters += (("temporal_state_id", temporal_state_id),)
             entity_mechanisms += (temporal_state_id,)
             event_mechanisms += ("temporal_state_process",)
-            temporal_mechanism = "state_trajectory"
+            temporal_parameters = (("selection", "state_trajectory"),)
+            if process is ProcessPriorKind.NONE:
+                process = ProcessPriorKind.STATE_MACHINE
         return MotifMechanismBundle(
             bundle_id=f"bundle_{occurrence_id}",
             motif_occurrence_id=occurrence_id,
@@ -268,8 +387,14 @@ class PriorPlanner:
                 ),
             ),
             population_mechanism="negative_binomial",
-            temporal_mechanism=temporal_mechanism,
-            attribute_mechanism="sampled_linear_cam",
+            attribute_mechanism=mechanism_ref(components.attribute),
+            relation_mechanism=mechanism_ref(components.relation),
+            temporal_mechanism=mechanism_ref(
+                components.temporal,
+                parameters=temporal_parameters,
+            ),
+            process_mechanism=mechanism_ref(process),
+            shared_state_ids=(shared_state_id,),
             compatible_task_families=("entity_future_event_existence",),
             parameters=parameters,
         )

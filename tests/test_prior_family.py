@@ -34,8 +34,23 @@ from rdb_prior.pipeline import (
     generate_database_instances,
     generate_physical_schemas,
 )
-from rdb_prior.priors.model import PriorFamily, TaskPolicyPlan
-from rdb_prior.priors.planner import PriorPlanner, PriorPlannerConfig
+from rdb_prior.priors.model import (
+    AttributePriorKind,
+    MechanismRef,
+    NuisancePlan,
+    NuisancePriorKind,
+    PriorCompositionPlan,
+    PriorFamily,
+    ProcessPriorKind,
+    RelationPriorKind,
+    TaskPolicyPlan,
+    TemporalPriorKind,
+)
+from rdb_prior.priors.planner import (
+    PriorCompositionConfig,
+    PriorPlanner,
+    PriorPlannerConfig,
+)
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
 from rdb_prior.schema.sampler import BlueprintSampler, BlueprintSamplerConfig
@@ -139,7 +154,7 @@ class PriorFamilyTests(unittest.TestCase):
         for entity_id in range(entity.row_count):
             per_entity = times[assignments == entity_id]
             self.assertTrue(np.all(np.diff(per_entity) >= 0))
-        self.assertIn(process.family, {"stationary", "seasonal", "churn"})
+        self.assertIn(process.family, {"stationary", "seasonal", "churn", "renewal"})
         self.assertTrue(all(mechanism.shared_state_ids for mechanism in plan.column_mechanisms))
 
         programs = TaskProgramPlanner().plan(
@@ -292,6 +307,161 @@ class PriorFamilyTests(unittest.TestCase):
         self.assertEqual("U", values.dtype.kind)
         self.assertTrue(np.any(values == ""))
         self.assertTrue(np.any(values != ""))
+
+    def test_prior_artifact_v1_is_upgraded_to_composition(self) -> None:
+        _runtime, _schema, prior, plan, _database = self._temporal_fixture()
+        legacy = prior.to_dict()
+        legacy.pop("composition")
+        for bundle in legacy["motif_bundles"]:
+            attribute = bundle["attribute_mechanism"]["kind"]
+            temporal = bundle["temporal_mechanism"]["kind"]
+            bundle["attribute_mechanism"] = (
+                "sampled_linear_cam"
+                if attribute == AttributePriorKind.COLUMN_SCM.value
+                else "legacy"
+            )
+            bundle["temporal_mechanism"] = (
+                "sampled_stationary_seasonal_churn"
+                if temporal != TemporalPriorKind.STATIC.value
+                else "legacy"
+            )
+            bundle.pop("relation_mechanism")
+            bundle.pop("process_mechanism")
+            bundle.pop("shared_state_ids")
+        restored = type(prior).from_dict(legacy)
+        self.assertIsNotNone(restored.composition)
+        assert restored.composition is not None
+        self.assertEqual(
+            NuisancePriorKind.LEGACY.value,
+            restored.composition.nuisance_plan.mechanism.kind,
+        )
+        self.assertEqual(restored.plan_id, plan.prior_composition_id)
+        self.assertEqual(restored, type(restored).from_dict(restored.to_dict()))
+
+    def test_composition_plan_can_combine_tree_temporal_and_nuisance(self) -> None:
+        _runtime, _schema, prior, _plan, _database = self._temporal_fixture()
+        assert prior.composition is not None
+        bundle = next(
+            item
+            for item in prior.composition.motif_bundles
+            if item.family is PriorFamily.TEMPORAL_EVENT
+        )
+        composed_bundle = replace(
+            bundle,
+            attribute_mechanism=MechanismRef(
+                kind=AttributePriorKind.TREE.value,
+                version="v1",
+            ),
+            relation_mechanism=MechanismRef(
+                kind=RelationPriorKind.TREE.value,
+                version="v1",
+            ),
+            temporal_mechanism=MechanismRef(
+                kind=TemporalPriorKind.CHURN.value,
+                version="v1",
+            ),
+            process_mechanism=MechanismRef(
+                kind=ProcessPriorKind.NONE.value,
+                version="v1",
+            ),
+        )
+        composition = replace(
+            prior.composition,
+            motif_bundles=tuple(
+                composed_bundle if item.bundle_id == bundle.bundle_id else item
+                for item in prior.composition.motif_bundles
+            ),
+            nuisance_plan=NuisancePlan(
+                mechanism=MechanismRef(
+                    kind=NuisancePriorKind.MNAR.value,
+                    version="v1",
+                )
+            ),
+        )
+        restored = PriorCompositionPlan.from_dict(composition.to_dict())
+        self.assertEqual(composition, restored)
+        self.assertEqual(NuisancePriorKind.MNAR.value, restored.nuisance_plan.mechanism.kind)
+        refs = (
+            restored.motif_bundles[0].attribute_mechanism,
+            restored.motif_bundles[0].relation_mechanism,
+            restored.motif_bundles[0].temporal_mechanism,
+            restored.motif_bundles[0].process_mechanism,
+            restored.nuisance_plan.mechanism,
+        )
+        self.assertTrue(all(item.version for item in refs))
+
+    def test_planner_uses_explicit_composition_for_temporal_bundle(self) -> None:
+        runtime = RuntimeContext(614).for_sample("composed_prior")
+        blueprint = BlueprintSampler(
+            BlueprintSamplerConfig(
+                min_tables=3,
+                max_tables=3,
+                min_motif_occurrences=1,
+                max_motif_occurrences=1,
+                max_extra_edges=0,
+                background_attachment_probability=0.0,
+                motif_weights=(("entity_event", 1.0),),
+            )
+        ).sample("composed_prior", runtime)
+        schema = PhysicalSchemaCompiler().compile(
+            blueprint,
+            "composed_prior",
+            runtime,
+        )
+        prior = PriorPlanner(
+            PriorPlannerConfig(
+                composition=PriorCompositionConfig(
+                    attribute=AttributePriorKind.TREE,
+                    relation=RelationPriorKind.TREE,
+                    temporal=TemporalPriorKind.CHURN,
+                    nuisance=NuisancePriorKind.MNAR,
+                )
+            )
+        ).plan(
+            blueprint=blueprint,
+            physical_schema=schema,
+            semantic_schema=sample_semantic_schema(
+                schema,
+                runtime.child("semantic"),
+            ),
+            runtime=runtime.child("prior"),
+        )
+        bundle = next(
+            item
+            for item in prior.motif_bundles
+            if item.family is PriorFamily.TEMPORAL_EVENT
+        )
+        self.assertEqual(AttributePriorKind.TREE.value, bundle.attribute_mechanism.kind)
+        self.assertEqual(RelationPriorKind.TREE.value, bundle.relation_mechanism.kind)
+        self.assertEqual(TemporalPriorKind.CHURN.value, bundle.temporal_mechanism.kind)
+        assert prior.composition is not None
+        self.assertEqual(
+            NuisancePriorKind.MNAR.value,
+            prior.composition.nuisance_plan.mechanism.kind,
+        )
+        with self.assertRaisesRegex(ValueError, "only executes column_scm"):
+            InstancePlanner(
+                InstancePlannerConfig(
+                    entity_rows_min=24,
+                    entity_rows_max=24,
+                    lookup_rows_min=4,
+                    lookup_rows_max=4,
+                    max_rows_per_table=256,
+                )
+            ).plan(
+                sample_id="composed_prior",
+                schema=schema,
+                runtime=runtime.child("instance"),
+                prior_plan=prior,
+            )
+
+    def test_composition_rejects_conflicting_axes(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires a temporal prior"):
+            PriorCompositionConfig(
+                attribute=AttributePriorKind.TREE,
+                relation=RelationPriorKind.STATE_CONDITIONED_EVENT,
+                temporal=TemporalPriorKind.STATIC,
+            )
 
     def test_legacy_instance_plan_and_artifact_readers_remain_compatible(self) -> None:
         runtime, schema, prior, plan, database = self._temporal_fixture()

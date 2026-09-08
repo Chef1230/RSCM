@@ -11,6 +11,8 @@ from rdb_prior.schema.semantics import SemanticSchemaPlan
 
 
 class PriorFamily(str, Enum):
+    """Compatibility label for the plan's primary executable family."""
+
     LEGACY_ROLE_SCM = "legacy_role_scm"
     RELATIONAL_SCM = "relational_scm"
     RELATIONAL_TREE = "relational_tree"
@@ -18,6 +20,45 @@ class PriorFamily(str, Enum):
     RULE_PROCESS = "rule_process"
 
 
+class AttributePriorKind(str, Enum):
+    LEGACY_SCM = "legacy_scm"
+    COLUMN_SCM = "column_scm"
+    TREE = "tree"
+    RULE = "rule"
+
+
+class RelationPriorKind(str, Enum):
+    UNIFORM = "uniform"
+    LATENT_AFFINITY = "latent_affinity"
+    SCM = "scm"
+    TREE = "tree"
+    COMMUNITY = "community"
+    STATE_CONDITIONED_EVENT = "state_conditioned_event"
+
+
+class TemporalPriorKind(str, Enum):
+    STATIC = "static"
+    STATIONARY = "stationary"
+    SEASONAL = "seasonal"
+    CHURN = "churn"
+    RENEWAL = "renewal"
+
+
+class ProcessPriorKind(str, Enum):
+    NONE = "none"
+    RULE = "rule"
+    STATE_MACHINE = "state_machine"
+    WORKFLOW = "workflow"
+
+
+class NuisancePriorKind(str, Enum):
+    LEGACY = "legacy"
+    MCAR = "mcar"
+    MAR = "mar"
+    MNAR = "mnar"
+    PROXY = "proxy"
+    SPURIOUS = "spurious"
+    DISTRACTOR = "distractor"
 
 
 class StateVisibility(str, Enum):
@@ -201,6 +242,15 @@ def _identifier(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a non-empty string")
 
 
+def _optional_identifier_tuple(name: str, values: object) -> None:
+    if not isinstance(values, tuple):
+        raise TypeError(f"{name} must be a tuple")
+    for value in values:
+        _identifier(name, value)
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} must not contain duplicates")
+
+
 def _seed(name: str, value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -223,6 +273,49 @@ def _parameters(values: tuple[tuple[str, object], ...]) -> tuple[tuple[str, obje
     if len({key for key, _value in normalized}) != len(normalized):
         raise ValueError("parameter names must be unique")
     return tuple(sorted(normalized, key=lambda item: item[0]))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class MechanismRef:
+    """Versioned choice on one orthogonal prior axis."""
+
+    kind: str
+    version: str
+    parameters: tuple[tuple[str, object], ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("mechanism kind", self.kind)
+        _identifier("mechanism version", self.version)
+        object.__setattr__(self, "parameters", _parameters(self.parameters))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "version": self.version,
+            "parameters": dict(self.parameters),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "MechanismRef":
+        return cls(
+            kind=data["kind"],
+            version=data["version"],
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+def _kind_ref(
+    value: MechanismRef,
+    allowed: type[Enum],
+    axis: str,
+) -> None:
+    if not isinstance(value, MechanismRef):
+        raise TypeError(f"{axis} mechanism must be MechanismRef")
+    if value.kind not in {item.value for item in allowed}:
+        allowed_values = ", ".join(item.value for item in allowed)
+        raise ValueError(
+            f"{axis} mechanism kind {value.kind!r} is not one of {allowed_values}"
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -287,36 +380,164 @@ class RelationMechanismBinding:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class MotifMechanismBundle:
+    """Mechanisms selected jointly for one schema motif occurrence.
+
+    Family and population mechanism stay as compatibility provenance.
+    The four MechanismRef fields are the compositional source of truth.
+    """
+
     bundle_id: str
     motif_occurrence_id: str
     family: PriorFamily
     node_bindings: tuple[TableMechanismBinding, ...]
     edge_bindings: tuple[RelationMechanismBinding, ...]
     population_mechanism: str
-    temporal_mechanism: str
-    attribute_mechanism: str
-    compatible_task_families: tuple[str, ...]
+    attribute_mechanism: MechanismRef
+    relation_mechanism: MechanismRef
+    temporal_mechanism: MechanismRef
+    process_mechanism: MechanismRef
+    shared_state_ids: tuple[str, ...] = ()
+    compatible_task_families: tuple[str, ...] = ()
     parameters: tuple[tuple[str, object], ...] = ()
 
     def __post_init__(self) -> None:
-        for name in ("bundle_id", "motif_occurrence_id", "population_mechanism", "temporal_mechanism", "attribute_mechanism"):
+        for name in ("bundle_id", "motif_occurrence_id", "population_mechanism"):
             _identifier(name, getattr(self, name))
         if not isinstance(self.family, PriorFamily):
             raise TypeError("family must be PriorFamily")
-        if not isinstance(self.node_bindings, tuple) or not all(isinstance(item, TableMechanismBinding) for item in self.node_bindings):
+        if not isinstance(self.node_bindings, tuple) or not all(
+            isinstance(item, TableMechanismBinding) for item in self.node_bindings
+        ):
             raise TypeError("node_bindings must contain TableMechanismBinding values")
-        if not isinstance(self.edge_bindings, tuple) or not all(isinstance(item, RelationMechanismBinding) for item in self.edge_bindings):
+        if not isinstance(self.edge_bindings, tuple) or not all(
+            isinstance(item, RelationMechanismBinding) for item in self.edge_bindings
+        ):
             raise TypeError("edge_bindings must contain RelationMechanismBinding values")
-        if not isinstance(self.compatible_task_families, tuple) or not all(isinstance(item, str) and item for item in self.compatible_task_families):
+        _kind_ref(self.attribute_mechanism, AttributePriorKind, "attribute")
+        _kind_ref(self.relation_mechanism, RelationPriorKind, "relation")
+        _kind_ref(self.temporal_mechanism, TemporalPriorKind, "temporal")
+        _kind_ref(self.process_mechanism, ProcessPriorKind, "process")
+        _optional_identifier_tuple("shared_state_ids", self.shared_state_ids)
+        if not isinstance(self.compatible_task_families, tuple) or not all(
+            isinstance(item, str) and item for item in self.compatible_task_families
+        ):
             raise TypeError("compatible_task_families must contain strings")
+        if (
+            self.relation_mechanism.kind
+            == RelationPriorKind.STATE_CONDITIONED_EVENT.value
+            and self.temporal_mechanism.kind == TemporalPriorKind.STATIC.value
+        ):
+            raise ValueError(
+                "state_conditioned_event relation requires a non-static temporal mechanism"
+            )
+        if (
+            self.process_mechanism.kind
+            in {
+                ProcessPriorKind.STATE_MACHINE.value,
+                ProcessPriorKind.WORKFLOW.value,
+            }
+            and self.temporal_mechanism.kind == TemporalPriorKind.STATIC.value
+        ):
+            raise ValueError(
+                "state-machine and workflow processes require a temporal mechanism"
+            )
         object.__setattr__(self, "parameters", _parameters(self.parameters))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"bundle_id": self.bundle_id, "motif_occurrence_id": self.motif_occurrence_id, "family": self.family.value, "node_bindings": [item.to_dict() for item in self.node_bindings], "edge_bindings": [item.to_dict() for item in self.edge_bindings], "population_mechanism": self.population_mechanism, "temporal_mechanism": self.temporal_mechanism, "attribute_mechanism": self.attribute_mechanism, "compatible_task_families": list(self.compatible_task_families), "parameters": dict(self.parameters)}
+        return {
+            "bundle_id": self.bundle_id,
+            "motif_occurrence_id": self.motif_occurrence_id,
+            "family": self.family.value,
+            "node_bindings": [item.to_dict() for item in self.node_bindings],
+            "edge_bindings": [item.to_dict() for item in self.edge_bindings],
+            "population_mechanism": self.population_mechanism,
+            "attribute_mechanism": self.attribute_mechanism.to_dict(),
+            "relation_mechanism": self.relation_mechanism.to_dict(),
+            "temporal_mechanism": self.temporal_mechanism.to_dict(),
+            "process_mechanism": self.process_mechanism.to_dict(),
+            "shared_state_ids": list(self.shared_state_ids),
+            "compatible_task_families": list(self.compatible_task_families),
+            "parameters": dict(self.parameters),
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "MotifMechanismBundle":
-        return cls(bundle_id=data["bundle_id"], motif_occurrence_id=data["motif_occurrence_id"], family=PriorFamily(data["family"]), node_bindings=tuple(TableMechanismBinding.from_dict(item) for item in data["node_bindings"]), edge_bindings=tuple(RelationMechanismBinding.from_dict(item) for item in data["edge_bindings"]), population_mechanism=data["population_mechanism"], temporal_mechanism=data["temporal_mechanism"], attribute_mechanism=data["attribute_mechanism"], compatible_task_families=tuple(data.get("compatible_task_families", ())), parameters=tuple(data.get("parameters", {}).items()))
+        family = PriorFamily(data["family"])
+        attribute_raw = data.get("attribute_mechanism", "legacy")
+        temporal_raw = data.get("temporal_mechanism", "legacy")
+        refs = _legacy_bundle_refs(family, attribute_raw, temporal_raw)
+        return cls(
+            bundle_id=data["bundle_id"],
+            motif_occurrence_id=data["motif_occurrence_id"],
+            family=family,
+            node_bindings=tuple(
+                TableMechanismBinding.from_dict(item)
+                for item in data.get("node_bindings", ())
+            ),
+            edge_bindings=tuple(
+                RelationMechanismBinding.from_dict(item)
+                for item in data.get("edge_bindings", ())
+            ),
+            population_mechanism=data.get("population_mechanism", "legacy"),
+            attribute_mechanism=(
+                MechanismRef.from_dict(attribute_raw)
+                if isinstance(attribute_raw, Mapping)
+                else refs[0]
+            ),
+            relation_mechanism=(
+                MechanismRef.from_dict(data["relation_mechanism"])
+                if isinstance(data.get("relation_mechanism"), Mapping)
+                else refs[1]
+            ),
+            temporal_mechanism=(
+                MechanismRef.from_dict(temporal_raw)
+                if isinstance(temporal_raw, Mapping)
+                else refs[2]
+            ),
+            process_mechanism=(
+                MechanismRef.from_dict(data["process_mechanism"])
+                if isinstance(data.get("process_mechanism"), Mapping)
+                else refs[3]
+            ),
+            shared_state_ids=tuple(data.get("shared_state_ids", ())),
+            compatible_task_families=tuple(data.get("compatible_task_families", ())),
+            parameters=tuple(data.get("parameters", {}).items()),
+        )
+
+
+def _legacy_bundle_refs(
+    family: PriorFamily,
+    attribute_name: object,
+    temporal_name: object,
+) -> tuple[MechanismRef, MechanismRef, MechanismRef, MechanismRef]:
+    if family is PriorFamily.TEMPORAL_EVENT:
+        return (
+            MechanismRef(
+                kind=AttributePriorKind.COLUMN_SCM.value,
+                version="v1",
+                parameters=(("legacy_name", str(attribute_name)),),
+            ),
+            MechanismRef(
+                kind=RelationPriorKind.STATE_CONDITIONED_EVENT.value,
+                version="v1",
+            ),
+            MechanismRef(
+                kind=TemporalPriorKind.STATIONARY.value,
+                version="v1",
+                parameters=(("legacy_name", str(temporal_name)),),
+            ),
+            MechanismRef(kind=ProcessPriorKind.NONE.value, version="v1"),
+        )
+    return (
+        MechanismRef(kind=AttributePriorKind.LEGACY_SCM.value, version="v1"),
+        MechanismRef(kind=RelationPriorKind.LATENT_AFFINITY.value, version="v1"),
+        MechanismRef(
+            kind=TemporalPriorKind.STATIC.value,
+            version="v1",
+            parameters=(("legacy_name", str(temporal_name)),),
+        ),
+        MechanismRef(kind=ProcessPriorKind.NONE.value, version="v1"),
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -354,6 +575,124 @@ class TaskPolicyPlan:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class NuisancePlan:
+    mechanism: MechanismRef
+
+    def __post_init__(self) -> None:
+        _kind_ref(self.mechanism, NuisancePriorKind, "nuisance")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"mechanism": self.mechanism.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "NuisancePlan":
+        return cls(mechanism=MechanismRef.from_dict(data["mechanism"]))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PriorCompositionPlan:
+    """Orthogonal prior selections for one database, independent of family label."""
+
+    plan_id: str
+    semantic_schema: SemanticSchemaPlan
+    shared_states: tuple[SharedStatePlan, ...]
+    motif_bundles: tuple[MotifMechanismBundle, ...]
+    nuisance_plan: NuisancePlan
+    task_policy: TaskPolicyPlan
+    seed: int
+    temporal_states: tuple[TemporalStatePlan, ...] = ()
+
+    def __post_init__(self) -> None:
+        _identifier("plan_id", self.plan_id)
+        if not isinstance(self.semantic_schema, SemanticSchemaPlan):
+            raise TypeError("semantic_schema must be SemanticSchemaPlan")
+        if not isinstance(self.shared_states, tuple) or not all(
+            isinstance(item, SharedStatePlan) for item in self.shared_states
+        ):
+            raise TypeError("shared_states must contain SharedStatePlan values")
+        if not isinstance(self.temporal_states, tuple) or not all(
+            isinstance(item, TemporalStatePlan) for item in self.temporal_states
+        ):
+            raise TypeError("temporal_states must contain TemporalStatePlan values")
+        if not isinstance(self.motif_bundles, tuple) or not all(
+            isinstance(item, MotifMechanismBundle) for item in self.motif_bundles
+        ):
+            raise TypeError("motif_bundles must contain MotifMechanismBundle values")
+        if not isinstance(self.nuisance_plan, NuisancePlan):
+            raise TypeError("nuisance_plan must be NuisancePlan")
+        if not isinstance(self.task_policy, TaskPolicyPlan):
+            raise TypeError("task_policy must be TaskPolicyPlan")
+        _seed("seed", self.seed)
+        if len({item.state_id for item in self.shared_states}) != len(
+            self.shared_states
+        ):
+            raise ValueError("shared state IDs must be unique")
+        if len({item.state_id for item in self.temporal_states}) != len(
+            self.temporal_states
+        ):
+            raise ValueError("temporal state IDs must be unique")
+        known_shared = {item.state_id for item in self.shared_states}
+        if any(
+            item.shared_state_id not in known_shared
+            for item in self.temporal_states
+        ):
+            raise ValueError("temporal states must reference shared states")
+        if len({item.bundle_id for item in self.motif_bundles}) != len(
+            self.motif_bundles
+        ):
+            raise ValueError("bundle IDs must be unique")
+
+    @property
+    def primary_family(self) -> PriorFamily:
+        return (
+            PriorFamily.TEMPORAL_EVENT
+            if any(
+                item.family is PriorFamily.TEMPORAL_EVENT
+                for item in self.motif_bundles
+            )
+            else PriorFamily.LEGACY_ROLE_SCM
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "semantic_schema": self.semantic_schema.to_dict(),
+            "shared_states": [item.to_dict() for item in self.shared_states],
+            "temporal_states": [
+                item.to_dict() for item in self.temporal_states
+            ],
+            "motif_bundles": [
+                item.to_dict() for item in self.motif_bundles
+            ],
+            "nuisance_plan": self.nuisance_plan.to_dict(),
+            "task_policy": self.task_policy.to_dict(),
+            "seed": self.seed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "PriorCompositionPlan":
+        return cls(
+            plan_id=data["plan_id"],
+            semantic_schema=SemanticSchemaPlan.from_dict(data["semantic_schema"]),
+            shared_states=tuple(
+                SharedStatePlan.from_dict(item)
+                for item in data.get("shared_states", ())
+            ),
+            temporal_states=tuple(
+                TemporalStatePlan.from_dict(item)
+                for item in data.get("temporal_states", ())
+            ),
+            motif_bundles=tuple(
+                MotifMechanismBundle.from_dict(item)
+                for item in data.get("motif_bundles", ())
+            ),
+            nuisance_plan=NuisancePlan.from_dict(data["nuisance_plan"]),
+            task_policy=TaskPolicyPlan.from_dict(data.get("task_policy", {})),
+            seed=data["seed"],
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class DatabasePriorPlan:
     plan_id: str
     family: PriorFamily
@@ -364,6 +703,7 @@ class DatabasePriorPlan:
     task_policy: TaskPolicyPlan
     seed: int
     temporal_states: tuple[TemporalStatePlan, ...] = ()
+    composition: PriorCompositionPlan | None = None
 
     def __post_init__(self) -> None:
         _identifier("plan_id", self.plan_id)
@@ -396,6 +736,35 @@ class DatabasePriorPlan:
 
         if len({item.bundle_id for item in self.motif_bundles}) != len(self.motif_bundles):
             raise ValueError("bundle IDs must be unique")
+        composition = self.composition
+        if composition is None:
+            composition = PriorCompositionPlan(
+                plan_id=self.plan_id,
+                semantic_schema=self.semantic_schema,
+                shared_states=self.shared_states,
+                temporal_states=self.temporal_states,
+                motif_bundles=self.motif_bundles,
+                nuisance_plan=NuisancePlan(
+                    mechanism=MechanismRef(
+                        kind=NuisancePriorKind.LEGACY.value,
+                        version="v1",
+                    )
+                ),
+                task_policy=self.task_policy,
+                seed=self.seed,
+            )
+            object.__setattr__(self, "composition", composition)
+        elif not isinstance(composition, PriorCompositionPlan):
+            raise TypeError("composition must be PriorCompositionPlan or None")
+        elif (
+            composition.semantic_schema != self.semantic_schema
+            or composition.shared_states != self.shared_states
+            or composition.temporal_states != self.temporal_states
+            or composition.motif_bundles != self.motif_bundles
+            or composition.task_policy != self.task_policy
+            or composition.seed != self.seed
+        ):
+            raise ValueError("composition must mirror DatabasePriorPlan provenance")
 
     def bundle(self, bundle_id: str) -> MotifMechanismBundle:
         return next(item for item in self.motif_bundles if item.bundle_id == bundle_id)
@@ -411,6 +780,9 @@ class DatabasePriorPlan:
             "motif_bundles": [item.to_dict() for item in self.motif_bundles],
             "task_policy": self.task_policy.to_dict(),
             "seed": self.seed,
+            "composition": (
+                None if self.composition is None else self.composition.to_dict()
+            ),
         }
 
     @classmethod
@@ -434,11 +806,24 @@ class DatabasePriorPlan:
                 TemporalStatePlan.from_dict(item)
                 for item in data.get("temporal_states", ())
             ),
+            composition=(
+                PriorCompositionPlan.from_dict(data["composition"])
+                if data.get("composition") is not None
+                else None
+            ),
         )
 
 
 __all__ = [
     "PriorFamily",
+    "AttributePriorKind",
+    "RelationPriorKind",
+    "TemporalPriorKind",
+    "ProcessPriorKind",
+    "NuisancePriorKind",
+    "MechanismRef",
+    "NuisancePlan",
+    "PriorCompositionPlan",
     "StateVisibility",
     "TransitionClock",
     "StateSpacePlan",
