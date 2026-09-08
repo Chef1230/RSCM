@@ -7,12 +7,14 @@ from collections.abc import Callable
 from rdb_prior.compilation.model import PhysicalSchema
 from rdb_prior.generation.model import DatabaseInstance
 from rdb_prior.generation.populations import resolve_state_conditioned_populations
+from rdb_prior.generation.relation_scm import resolve_relational_scm_population
 from rdb_prior.instance.plan import InstancePlan
 
 
 _Finalizer = Callable[[PhysicalSchema, InstancePlan, DatabaseInstance], InstancePlan]
 _FINALIZERS: dict[str, _Finalizer] = {
     "temporal_event": resolve_state_conditioned_populations,
+    "relational_scm": resolve_relational_scm_population,
 }
 
 

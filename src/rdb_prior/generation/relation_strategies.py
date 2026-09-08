@@ -6,6 +6,7 @@ import numpy as np
 
 from rdb_prior.generation.latent import LatentRegistry
 from rdb_prior.generation.trees.executor import evaluate_forest
+from rdb_prior.generation.relation_scm import generate_relation_scm
 from rdb_prior.instance.plan import RelationMechanismPlan
 
 
@@ -14,6 +15,7 @@ def generate_single_relation(
     *,
     child_rows: int,
     latents: LatentRegistry,
+    population_counts: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     if len(plan.foreign_key_ids) != 1:
         raise ValueError("single relation strategy requires one foreign key")
@@ -22,6 +24,14 @@ def generate_single_relation(
     child = latents.table(plan.child_table_id).values
     parent = latents.table(parent_id)
 
+    if plan.family.startswith("scm_"):
+        assignments = generate_relation_scm(
+            plan,
+            child_rows=child_rows,
+            latents=latents,
+            population_counts=population_counts,
+        )
+        return {plan.foreign_key_ids[0]: assignments}
     if plan.family == "tree_propensity":
         assignments = _tree_propensity_assignments(child, parent.values, parent.activity, plan, rng)
     elif plan.family == "lookup_cpt":

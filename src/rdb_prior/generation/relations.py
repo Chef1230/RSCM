@@ -17,6 +17,14 @@ def generate_relations(
     latents: LatentRegistry,
 ) -> dict[str, np.ndarray]:
     values: dict[str, np.ndarray] = {}
+    population_counts = {
+        mechanism.table_id: np.asarray(
+            dict(mechanism.parameters).get("entity_event_counts", ()),
+            dtype=np.int64,
+        )
+        for mechanism in plan.population_mechanisms
+        if dict(mechanism.parameters).get("entity_event_counts") is not None
+    }
     for relation in plan.relations:
         child_rows = plan.table(
             relation.child_table_id
@@ -32,6 +40,7 @@ def generate_relations(
                 relation,
                 child_rows=child_rows,
                 latents=latents,
+                population_counts=population_counts.get(relation.child_table_id),
             )
         overlap = set(values) & set(generated)
         if overlap:

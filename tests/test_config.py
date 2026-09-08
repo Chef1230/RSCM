@@ -112,6 +112,25 @@ class SchemaConfigTests(unittest.TestCase):
                 "prior:\n"
                 "  mode: compositional\n"
                 "  database_family_weights:\n"
+                "    relational_scm: 1.0\n"
+                "  relational_scm:\n"
+                "    column_dag_depth: [1, 3]\n"
+                "    parent_count: [1, 4]\n"
+                "    mechanisms:\n"
+                "      linear: 1.0\n",
+                encoding="utf-8",
+            )
+            scm_configured = load_instance_pipeline_config(path).prior
+            self.assertIsNotNone(scm_configured)
+            assert scm_configured is not None
+            self.assertEqual((1, 3), scm_configured.relational_scm.column_dag_depth)
+            self.assertEqual((1, 4), scm_configured.relational_scm.parent_count)
+            self.assertEqual((("linear", 1.0),), scm_configured.relational_scm.mechanism_weights)
+
+            path.write_text(
+                "prior:\n"
+                "  mode: compositional\n"
+                "  database_family_weights:\n"
                 "    temporal_event: 1.0\n"
                 "  motif_family_weights: {}\n",
                 encoding="utf-8",

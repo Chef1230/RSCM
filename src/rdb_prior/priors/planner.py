@@ -114,6 +114,84 @@ class PriorCompositionConfig:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class RelationSCMConfig:
+    """Controls direct sampling of column, relation, and population SCMs."""
+
+    column_dag_depth: tuple[int, int] = (1, 4)
+    parent_count: tuple[int, int] = (1, 5)
+    mechanism_weights: tuple[tuple[str, float], ...] = (
+        ("linear", 0.35),
+        ("cam", 0.30),
+        ("mlp", 0.20),
+        ("exogenous", 0.15),
+    )
+    relation_mechanism_weights: tuple[tuple[str, float], ...] = (
+        ("scm_logistic_propensity", 0.40),
+        ("scm_softmax_affinity", 0.30),
+        ("scm_cpt", 0.15),
+        ("scm_community", 0.15),
+    )
+    population_mechanism_weights: tuple[tuple[str, float], ...] = (
+        ("poisson", 0.35),
+        ("negative_binomial", 0.45),
+        ("zero_inflated_negative_binomial", 0.20),
+    )
+
+    def __post_init__(self) -> None:
+        for name, bounds in (
+            ("column_dag_depth", self.column_dag_depth),
+            ("parent_count", self.parent_count),
+        ):
+            if (
+                not isinstance(bounds, tuple)
+                or len(bounds) != 2
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int)
+                    for item in bounds
+                )
+                or bounds[0] < 1
+                or bounds[1] < bounds[0]
+            ):
+                raise ValueError(f"{name} must be an increasing positive integer pair")
+        self._validate_weights(self.mechanism_weights, "mechanism_weights", {"exogenous", "linear", "cam", "mlp"})
+        self._validate_weights(
+            self.relation_mechanism_weights,
+            "relation_mechanism_weights",
+            {"scm_logistic_propensity", "scm_softmax_affinity", "scm_cpt", "scm_community"},
+        )
+        self._validate_weights(
+            self.population_mechanism_weights,
+            "population_mechanism_weights",
+            {"poisson", "negative_binomial", "zero_inflated_negative_binomial"},
+        )
+
+    @staticmethod
+    def _validate_weights(
+        values: tuple[tuple[str, float], ...],
+        name: str,
+        allowed: set[str],
+    ) -> None:
+        if not isinstance(values, tuple) or not values:
+            raise ValueError(f"{name} must be non-empty")
+        seen: set[str] = set()
+        for item in values:
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not item[0] in allowed
+                or item[0] in seen
+                or isinstance(item[1], bool)
+                or not isinstance(item[1], (int, float))
+                or item[1] < 0
+            ):
+                raise ValueError(f"{name} contains an invalid mechanism")
+            seen.add(item[0])
+        if not any(item[1] > 0 for item in values):
+            raise ValueError(f"{name} must contain a positive weight")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RelationTreeConfig:
     """Bounded direct-prior controls for random relation/attribute forests."""
 
@@ -155,6 +233,7 @@ class PriorPlannerConfig:
     shared_state_family: str = "gaussian_mixture"
     temporal_state: TemporalStateConfig = TemporalStateConfig()
     composition: PriorCompositionConfig | None = None
+    relational_scm: RelationSCMConfig = RelationSCMConfig()
     relational_tree: RelationTreeConfig = RelationTreeConfig()
 
     def __post_init__(self) -> None:
@@ -179,6 +258,8 @@ class PriorPlannerConfig:
             raise ValueError("unsupported shared-state family")
         if not isinstance(self.temporal_state, TemporalStateConfig):
             raise TypeError("temporal_state must be TemporalStateConfig")
+        if not isinstance(self.relational_scm, RelationSCMConfig):
+            raise TypeError("relational_scm must be RelationSCMConfig")
         if not isinstance(self.relational_tree, RelationTreeConfig):
             raise TypeError("relational_tree must be RelationTreeConfig")
         if (
@@ -233,7 +314,14 @@ class PriorPlanner:
                         components.attribute is AttributePriorKind.TREE
                         or components.relation is RelationPriorKind.TREE
                     )
-                    else PriorFamily.LEGACY_ROLE_SCM
+                    else (
+                        PriorFamily.RELATIONAL_SCM
+                        if (
+                            components.attribute is AttributePriorKind.COLUMN_SCM
+                            or components.relation is RelationPriorKind.SCM
+                        )
+                        else PriorFamily.LEGACY_ROLE_SCM
+                    )
                 )
             elif candidates:
                 family = PriorFamily.TEMPORAL_EVENT
@@ -284,6 +372,16 @@ class PriorPlanner:
                         components=components,
                         semantic_schema=semantic_schema,
                         physical_schema=physical_schema,
+                        runtime=runtime,
+                    )
+                )
+                continue
+            if family is PriorFamily.RELATIONAL_SCM:
+                bundles.append(
+                    self._relational_scm_bundle(
+                        occurrence=occurrence,
+                        physical_schema=physical_schema,
+                        semantic_schema=semantic_schema,
                         runtime=runtime,
                     )
                 )
@@ -380,10 +478,217 @@ class PriorPlanner:
                 relation=RelationPriorKind.TREE,
                 temporal=TemporalPriorKind.STATIC,
             )
+        if family is PriorFamily.RELATIONAL_SCM:
+            return PriorCompositionConfig(
+                attribute=AttributePriorKind.COLUMN_SCM,
+                relation=RelationPriorKind.SCM,
+                temporal=TemporalPriorKind.STATIC,
+            )
         return PriorCompositionConfig(
             attribute=AttributePriorKind.LEGACY_SCM,
             relation=RelationPriorKind.LATENT_AFFINITY,
             temporal=TemporalPriorKind.STATIC,
+        )
+
+    def _relational_scm_bundle(
+        self,
+        *,
+        occurrence: object,
+        physical_schema: PhysicalSchema,
+        semantic_schema: SemanticSchemaPlan,
+        runtime: RuntimeContext,
+    ) -> MotifMechanismBundle:
+        config = self.config.relational_scm
+        table_ids = tuple(table_id for _slot, table_id in occurrence.node_bindings)
+        table_id_set = set(table_ids)
+        column_payloads: list[dict[str, object]] = []
+        for table_id in table_ids:
+            table = physical_schema.table(table_id)
+            prior_features = [
+                column.column_id
+                for column in table.columns
+                if column.kind is ColumnKind.FEATURE
+            ]
+            parent_features: list[str] = []
+            for foreign_key in physical_schema.foreign_keys:
+                if (
+                    foreign_key.child_table_id == table_id
+                    and foreign_key.parent_table_id in table_id_set
+                ):
+                    parent_features.extend(
+                        column.column_id
+                        for column in physical_schema.table(
+                            foreign_key.parent_table_id
+                        ).columns
+                        if column.kind is ColumnKind.FEATURE
+                    )
+            depth_by_column: dict[str, int] = {}
+            for ordinal, column in enumerate(
+                item for item in table.columns if item.kind is ColumnKind.FEATURE
+            ):
+                rng = runtime.numpy_rng(
+                    "prior",
+                    "relational-scm-column",
+                    f"{occurrence.occurrence_id}:{column.column_id}",
+                )
+                candidates = tuple(
+                    item
+                    for item in dict.fromkeys(
+                        prior_features[:ordinal] + parent_features
+                    )
+                    if depth_by_column.get(item, 0)
+                    < config.column_dag_depth[1]
+                )
+                lower, upper = config.parent_count
+                count = min(
+                    len(candidates),
+                    int(rng.integers(lower, upper + 1)),
+                )
+                selected = (
+                    tuple(
+                        str(item)
+                        for item in rng.choice(
+                            np.asarray(candidates, dtype=object),
+                            size=count,
+                            replace=False,
+                        )
+                    )
+                    if count
+                    else ()
+                )
+                families, weights = zip(*config.mechanism_weights)
+                family = runtime.python_rng(
+                    "prior",
+                    "relational-scm-family",
+                    f"{occurrence.occurrence_id}:{column.column_id}",
+                ).choices(families, weights=weights, k=1)[0]
+                depth_by_column[column.column_id] = (
+                    0
+                    if not selected
+                    else min(
+                        config.column_dag_depth[1],
+                        1 + max(
+                            (
+                                depth_by_column.get(parent_id, 0)
+                                for parent_id in selected
+                            ),
+                            default=0,
+                        ),
+                    )
+                )
+                column_payloads.append(
+                    {
+                        "column_id": column.column_id,
+                        "parent_column_ids": list(selected),
+                        "parent_state_ids": [],
+                        "family": family,
+                        "parameters": {
+                            "mechanism_seed": int(rng.integers(0, 2**63 - 1)),
+                            "noise_scale": float(rng.uniform(0.08, 0.30)),
+                            "signal_scale": float(rng.uniform(0.6, 1.4)),
+                            "activation_scale": float(rng.uniform(0.7, 1.5)),
+                            "output_scale": float(rng.uniform(0.8, 1.2)),
+                            "mlp_depth": int(rng.integers(1, 3)),
+                            "mlp_hidden_factor": float(rng.uniform(1.5, 3.0)),
+                        },
+                    }
+                )
+        relation_payloads: dict[str, object] = {}
+        relation_families, relation_weights = zip(
+            *config.relation_mechanism_weights
+        )
+        population_payloads: dict[str, object] = {}
+        population_families, population_weights = zip(
+            *config.population_mechanism_weights
+        )
+        edges: list[RelationMechanismBinding] = []
+        for foreign_key in physical_schema.foreign_keys:
+            if foreign_key.child_table_id not in table_id_set:
+                continue
+            rng = runtime.numpy_rng(
+                "prior",
+                "relational-scm-relation",
+                f"{occurrence.occurrence_id}:{foreign_key.foreign_key_id}",
+            )
+            family = runtime.python_rng(
+                "prior",
+                "relational-scm-relation-family",
+                f"{occurrence.occurrence_id}:{foreign_key.foreign_key_id}",
+            ).choices(relation_families, weights=relation_weights, k=1)[0]
+            relation_payloads[foreign_key.foreign_key_id] = {
+                "foreign_key_id": foreign_key.foreign_key_id,
+                "family": family,
+            }
+            edges.append(
+                RelationMechanismBinding(
+                    foreign_key_id=foreign_key.foreign_key_id,
+                    mechanism_id=family,
+                )
+            )
+        for table_id in table_ids:
+            table = physical_schema.table(table_id)
+            if table.role.value != "event":
+                continue
+            parent = next(
+                (
+                    item
+                    for item in physical_schema.foreign_keys
+                    if item.child_table_id == table_id
+                    and item.relation_strategy != "lookup_assignment"
+                    and item.parent_table_id in table_id_set
+                ),
+                None,
+            )
+            if parent is None:
+                continue
+            rng = runtime.numpy_rng(
+                "prior",
+                "relational-scm-population",
+                f"{occurrence.occurrence_id}:{table_id}",
+            )
+            family = runtime.python_rng(
+                "prior",
+                "relational-scm-population-family",
+                f"{occurrence.occurrence_id}:{table_id}",
+            ).choices(population_families, weights=population_weights, k=1)[0]
+            population_payloads[table_id] = {
+                "table_id": table_id,
+                "parent_table_id": parent.parent_table_id,
+                "family": family,
+                "baseline": float(rng.uniform(0.5, 2.0)),
+                "dispersion": float(rng.uniform(1.5, 5.0)),
+                "zero_probability": float(rng.uniform(0.15, 0.40)),
+            }
+        return MotifMechanismBundle(
+            bundle_id=f"bundle_{occurrence.occurrence_id}",
+            motif_occurrence_id=occurrence.occurrence_id,
+            family=PriorFamily.RELATIONAL_SCM,
+            node_bindings=tuple(
+                TableMechanismBinding(
+                    table_id=table_id,
+                    mechanism_ids=("column_scm_dag",),
+                )
+                for table_id in table_ids
+            ),
+            edge_bindings=tuple(edges),
+            population_mechanism="population_scm",
+            attribute_mechanism=mechanism_ref(AttributePriorKind.COLUMN_SCM),
+            relation_mechanism=mechanism_ref(RelationPriorKind.SCM),
+            temporal_mechanism=mechanism_ref(TemporalPriorKind.STATIC),
+            process_mechanism=mechanism_ref(ProcessPriorKind.NONE),
+            compatible_task_families=(),
+            parameters=(
+                ("column_mechanisms", column_payloads),
+                ("relation_mechanisms", relation_payloads),
+                ("population_mechanisms", population_payloads),
+                (
+                    "semantic_table_roles",
+                    [
+                        [table_id, semantic_schema.table_role(table_id).value]
+                        for table_id in table_ids
+                    ],
+                ),
+            ),
         )
 
     def _forest(
@@ -810,4 +1115,4 @@ def _sample_transition_matrix(
 
 
 
-__all__ = ["RelationTreeConfig", "TemporalStateConfig", "PriorPlannerConfig", "PriorPlanner"]
+__all__ = ["RelationSCMConfig", "RelationTreeConfig", "TemporalStateConfig", "PriorPlannerConfig", "PriorPlanner"]

@@ -36,6 +36,7 @@ from rdb_prior.priors.model import (
 )
 from rdb_prior.priors.planner import (
     PriorPlannerConfig,
+    RelationSCMConfig,
     RelationTreeConfig,
     TemporalStateConfig,
 )
@@ -633,6 +634,7 @@ _PRIOR_OPTIONS = {
     "shared_state",
     "temporal_state",
     "relational_tree",
+    "relational_scm",
 }
 
 _PRIOR_SHARED_STATE_OPTIONS = {"family", "dimension"}
@@ -657,6 +659,14 @@ _PRIOR_RELATIONAL_TREE_OPTIONS = {
     "use_for_attributes",
     "use_for_event_intensity",
     "use_for_relation_propensity",
+}
+
+_PRIOR_RELATIONAL_SCM_OPTIONS = {
+    "column_dag_depth",
+    "parent_count",
+    "mechanisms",
+    "relation_mechanisms",
+    "population_mechanisms",
 }
 _PRIOR_VISIBILITY_OPTIONS = {"family"}
 _DEBUG_OPTIONS = {"persist_private_state_trajectory"}
@@ -1468,6 +1478,9 @@ def _prior_planner_config(raw: Mapping[str, Any]) -> PriorPlannerConfig | None:
         relational_tree=_relational_tree_config(
             _mapping(raw.get("relational_tree", {}), "config.prior.relational_tree")
         ),
+        relational_scm=_relational_scm_config(
+            _mapping(raw.get("relational_scm", {}), "config.prior.relational_scm")
+        ),
     )
 
 
@@ -1486,6 +1499,98 @@ def _shared_state_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "family": shared.get("family", "gaussian_mixture"),
         "dimension": shared.get("dimension", raw.get("state_dimension", 4)),
     }
+
+
+def _relational_scm_config(raw: Mapping[str, Any]) -> RelationSCMConfig:
+    _reject_unknown(
+        raw,
+        _PRIOR_RELATIONAL_SCM_OPTIONS,
+        "config.prior.relational_scm",
+    )
+
+    def pair(name: str, default: tuple[int, int]) -> tuple[int, int]:
+        value = raw.get(name, list(default))
+        if not isinstance(value, list) or len(value) != 2:
+            raise SchemaConfigError(
+                f"config.prior.relational_scm.{name} must be a two-item list"
+            )
+        if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+            raise SchemaConfigError(
+                f"config.prior.relational_scm.{name} must contain integers"
+            )
+        return value[0], value[1]
+
+    def weights(
+        name: str,
+        default: tuple[tuple[str, float], ...],
+        allowed: set[str],
+    ) -> tuple[tuple[str, float], ...]:
+        value = raw.get(name)
+        if value is None:
+            return default
+        mapping = _mapping(
+            value,
+            f"config.prior.relational_scm.{name}",
+        )
+        if not mapping:
+            raise SchemaConfigError(
+                f"config.prior.relational_scm.{name} must be non-empty"
+            )
+        result: list[tuple[str, float]] = []
+        for key, weight in sorted(mapping.items()):
+            if key not in allowed:
+                raise SchemaConfigError(
+                    f"unknown Relation SCM mechanism {key!r}"
+                )
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or weight < 0
+            ):
+                raise SchemaConfigError(
+                    f"config.prior.relational_scm.{name}.{key} must be non-negative"
+                )
+            result.append((key, float(weight)))
+        if not any(weight > 0 for _key, weight in result):
+            raise SchemaConfigError(
+                f"config.prior.relational_scm.{name} must contain a positive weight"
+            )
+        return tuple(result)
+
+    defaults = RelationSCMConfig()
+    try:
+        return RelationSCMConfig(
+            column_dag_depth=pair("column_dag_depth", defaults.column_dag_depth),
+            parent_count=pair("parent_count", defaults.parent_count),
+            mechanism_weights=weights(
+                "mechanisms",
+                defaults.mechanism_weights,
+                {"exogenous", "linear", "cam", "mlp"},
+            ),
+            relation_mechanism_weights=weights(
+                "relation_mechanisms",
+                defaults.relation_mechanism_weights,
+                {
+                    "scm_logistic_propensity",
+                    "scm_softmax_affinity",
+                    "scm_cpt",
+                    "scm_community",
+                },
+            ),
+            population_mechanism_weights=weights(
+                "population_mechanisms",
+                defaults.population_mechanism_weights,
+                {
+                    "poisson",
+                    "negative_binomial",
+                    "zero_inflated_negative_binomial",
+                },
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise SchemaConfigError(
+            f"Invalid config.prior.relational_scm: {error}"
+        ) from error
 
 
 def _relational_tree_config(raw: Mapping[str, Any]) -> RelationTreeConfig:

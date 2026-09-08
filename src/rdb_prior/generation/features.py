@@ -12,6 +12,7 @@ from rdb_prior.compilation.model import (
     PhysicalSchema,
     PhysicalTable,
 )
+from rdb_prior.generation.column_dag import execute_column_dag
 from rdb_prior.generation.feature_strategies import generate_feature_signal
 from rdb_prior.generation.latent import LatentRegistry
 from rdb_prior.generation.trees.executor import evaluate_forest
@@ -51,6 +52,18 @@ def generate_table_features(
         raise ValueError("instance plan lacks calendar interval")
     values: dict[str, np.ndarray] = {}
     mechanisms = {item.column_id: item for item in plan.column_mechanisms}
+    dag_values = (
+        execute_column_dag(
+            schema=schema,
+            table=table,
+            mechanisms=mechanisms,
+            latents=latents,
+            relations=relations,
+            generated_tables=generated_tables,
+        )
+        if plan.prior_family == "relational_scm"
+        else {}
+    )
 
     # Tree mechanisms may use time regardless of physical column order.
     for column in table.columns:
@@ -74,7 +87,9 @@ def generate_table_features(
         }:
             continue
         mechanism = mechanisms.get(column.column_id)
-        if (
+        if column.column_id in dag_values:
+            signal = dag_values[column.column_id]
+        elif (
             mechanism is not None
             and mechanism.family == "tree"
             and plan.prior_family != "temporal_event"
@@ -88,7 +103,7 @@ def generate_table_features(
                 generated_tables=generated_tables,
                 local_values=values,
             )
-        else:
+        elif column.column_id not in dag_values:
             signal = generate_feature_signal(
                 table_plan.feature_family,
                 context,

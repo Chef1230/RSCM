@@ -18,6 +18,8 @@ from rdb_prior.priors.model import (
 from rdb_prior.priors.planner import (
     PriorPlanner,
     PriorPlannerConfig,
+    RelationSCMConfig,
+    RelationTreeConfig,
     TemporalStateConfig,
 )
 
@@ -36,6 +38,8 @@ __all__ = [
     "TaskPolicyPlan",
     "DatabasePriorPlan",
     "TemporalStateConfig",
+    "RelationSCMConfig",
+    "RelationTreeConfig",
     "PriorPlannerConfig",
     "PriorPlanner",
 ]
