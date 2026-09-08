@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,23 @@ from .model import RDBPFNDataset
 
 _LABEL_COLUMN = "label"
 _CUTOFF_COLUMN = "cutoff_time"
+_PRIVATE_METADATA_KEYS = frozenset(
+    {
+        "semantic_schema",
+        "database_prior_plan",
+        "prior_plan",
+        "prior_provenance",
+        "prior_composition",
+        "shared_states",
+        "temporal_states",
+        "temporal_state_trajectory",
+        "motif_bundles",
+        "nuisance_plan",
+        "task_program",
+        "prior_binding",
+        "materialization",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -181,7 +199,7 @@ class RDBPFNConverter:
             "tables": table_metadata,
             "tasks": [task_metadata],
         }
-        return RDBPFNDataset(
+        dataset = RDBPFNDataset(
             dataset_name=plan.task_id,
             task_name=plan.task_id,
             metadata=metadata,
@@ -189,6 +207,8 @@ class RDBPFNConverter:
             splits=task_splits,
             masked_columns=tuple(masked_columns),
         )
+        assert_export_has_no_private_metadata(dataset)
+        return dataset
 
     def _column_values(
         self,
@@ -511,6 +531,28 @@ def _category_count(values: np.ndarray) -> int:
     return max(1, int(len(np.unique(values))))
 
 
+def assert_export_has_no_private_metadata(dataset: RDBPFNDataset) -> None:
+    """Fail closed if generator-private provenance reaches model metadata."""
+    if not isinstance(dataset, RDBPFNDataset):
+        raise TypeError("dataset must be RDBPFNDataset")
+    _assert_public_mapping(dataset.metadata, location="metadata")
+    for table_name, columns in dataset.tables.items():
+        _assert_public_mapping(columns, location=f"tables.{table_name}")
+
+
+def _assert_public_mapping(value: Any, *, location: str) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if key in _PRIVATE_METADATA_KEYS:
+                raise ValueError(
+                    f"generator-private metadata leaked into exported {location}: {key}"
+                )
+            _assert_public_mapping(child, location=f"{location}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _assert_public_mapping(child, location=f"{location}[{index}]")
+
+
 def _stratified_validation_indices(
     labels: np.ndarray,
     *,
@@ -536,4 +578,4 @@ def _stratified_validation_indices(
     return np.asarray(sorted(selected), dtype=np.int64)
 
 
-__all__ = ["RDBPFNConverter"]
+__all__ = ["RDBPFNConverter", "assert_export_has_no_private_metadata"]

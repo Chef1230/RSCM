@@ -39,6 +39,7 @@ class TaskArtifactWriter:
         task: PlannedTask,
         report: TaskValidationReport,
         task_program: TaskProgramPlan | None = None,
+        prior_binding: Mapping[str, Any] | None = None,
     ) -> Path:
         for name, value in (
             ("sample_id", sample_id),
@@ -63,6 +64,8 @@ class TaskArtifactWriter:
             _write_json(temporary / "task_plan.json", task.plan.to_dict())
             if task_program is not None:
                 _write_json(temporary / "task_program.json", task_program.to_dict())
+            if prior_binding is not None:
+                _write_json(temporary / "task_provenance.json", dict(prior_binding))
             _write_json(temporary / "runtime.json", runtime.to_dict())
             _write_json(temporary / "validation.json", report.to_dict())
             with (temporary / "task_data.npz").open("wb") as handle:
@@ -77,7 +80,7 @@ class TaskArtifactWriter:
                 temporary / "artifact.json",
                 {
                     "artifact_type": "relational_task",
-                    "artifact_version": 2,
+                    "artifact_version": 3,
                     "sample_id": sample_id,
                     "task_id": task.plan.task_id,
                     "instance_artifact": instance_artifact,
@@ -88,6 +91,9 @@ class TaskArtifactWriter:
                     "validation": "validation.json",
                     "task_program": (
                         None if task_program is None else "task_program.json"
+                    ),
+                    "prior_binding": (
+                        None if prior_binding is None else "task_provenance.json"
                     ),
                 },
             )
@@ -120,11 +126,12 @@ class TaskArtifactWriter:
             path,
             {
                 "artifact_type": "relational_task_manifest",
-                "artifact_version": 1,
+                "artifact_version": 2,
                 "configuration": dict(configuration),
                 "database_count": database_count,
                 "task_count": len(encoded_entries),
                 "entries": encoded_entries,
+                "statistics": _task_manifest_statistics(encoded_entries),
             },
         )
         return path
@@ -139,6 +146,7 @@ class TaskArtifact:
     task: PlannedTask
     validation: TaskValidationReport
     task_program: TaskProgramPlan | None = None
+    prior_binding: Mapping[str, Any] | None = None
 
 
 def load_task_artifact(path: str | Path) -> TaskArtifact:
@@ -146,7 +154,7 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     if payload.get("artifact_type") != "relational_task":
         raise ValueError("unsupported task artifact type")
-    if payload.get("artifact_version") not in {1, 2}:
+    if payload.get("artifact_version") not in {1, 2, 3}:
         raise ValueError("unsupported task artifact version")
     root = artifact_path.parent
     plan = TaskPlan.from_dict(
@@ -172,6 +180,12 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
             json.loads((root / payload["task_program"]).read_text(encoding="utf-8"))
         )
     )
+    binding_file = payload.get("prior_binding")
+    prior_binding = (
+        None
+        if binding_file is None
+        else json.loads((root / binding_file).read_text(encoding="utf-8"))
+    )
     if plan.task_id != payload["task_id"]:
         raise ValueError("task artifact plan identity mismatch")
     return TaskArtifact(
@@ -182,7 +196,24 @@ def load_task_artifact(path: str | Path) -> TaskArtifact:
         task=PlannedTask(plan=plan, data=data),
         validation=validation,
         task_program=task_program,
+        prior_binding=prior_binding,
     )
+
+
+def _task_manifest_statistics(entries: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    prior_counts: dict[str, int] = {}
+    for entry in entries:
+        program = entry.get("task_program_family")
+        if isinstance(program, str) and program:
+            counts[program] = counts.get(program, 0) + 1
+        family = entry.get("prior_family")
+        if isinstance(family, str) and family:
+            prior_counts[family] = prior_counts.get(family, 0) + 1
+    return {
+        "task_program_counts": dict(sorted(counts.items())),
+        "prior_family_counts": dict(sorted(prior_counts.items())),
+    }
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:

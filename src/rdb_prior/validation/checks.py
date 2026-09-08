@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -14,7 +14,9 @@ from rdb_prior.compilation.model import (
 )
 from rdb_prior.generation.model import DatabaseInstance
 from rdb_prior.instance.plan import InstancePlan
+from rdb_prior.priors.registry import mechanism_ref
 from rdb_prior.schema.spec import Optionality
+from rdb_prior.task.program import TaskProgramPlan
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -75,6 +77,16 @@ class InstanceValidationReport:
                 for item in data.get("issues", ())
             ),
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TaskProgramValidationReport:
+    program_id: str
+    issues: tuple[InstanceValidationIssue, ...] = ()
+
+    @property
+    def is_valid(self) -> bool:
+        return not self.issues
 
 
 def validate_instance_plan(
@@ -144,11 +156,240 @@ def validate_instance_plan(
                     foreign_key_id=foreign_key.foreign_key_id,
                 )
             )
+    issues.extend(_validate_prior_references(schema, plan))
     return InstanceValidationReport(
         schema_id=schema.schema_id,
         plan_id=plan.plan_id,
         issues=tuple(issues),
     )
+
+
+def validate_task_program(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+    program: TaskProgramPlan,
+) -> TaskProgramValidationReport:
+    """Verify that a pre-data task refers only to its compatible bundle."""
+    issues: list[InstanceValidationIssue] = []
+    tables = {item.table_id for item in schema.tables}
+    foreign_keys = {item.foreign_key_id: item for item in schema.foreign_keys}
+    bundles = {item.bundle_id: item for item in plan.motif_bundles}
+    if program.target_table_id not in tables:
+        issues.append(_issue("task_program_target_table", "target table does not exist", table_id=program.target_table_id))
+    if program.source_table_id and program.source_table_id not in tables:
+        issues.append(_issue("task_program_source_table", "source table does not exist", table_id=program.source_table_id))
+    if program.foreign_key_id and program.foreign_key_id not in foreign_keys:
+        issues.append(_issue("task_program_foreign_key", "foreign key does not exist", foreign_key_id=program.foreign_key_id))
+    if plan.prior_plan_id and program.prior_plan_id and plan.prior_plan_id != program.prior_plan_id:
+        issues.append(_issue("task_program_prior_plan", "program prior plan differs from instance plan"))
+
+    selected = []
+    for bundle_id in program.required_bundle_ids:
+        bundle = bundles.get(bundle_id)
+        if bundle is None:
+            issues.append(_issue("task_program_bundle", f"unknown required bundle: {bundle_id}"))
+        else:
+            selected.append(bundle)
+    if not selected:
+        issues.append(_issue("task_program_no_bundle", "program has no resolved mechanism bundle"))
+    available: set[str] = set()
+    for bundle in selected:
+        if bundle.compatible_task_families and program.family not in bundle.compatible_task_families:
+            issues.append(_issue("task_program_incompatible_family", f"{program.family} is not compatible with bundle {bundle.bundle_id}"))
+        available.add(bundle.bundle_id)
+        available.add(bundle.population_mechanism)
+        available.update(
+            mechanism_id
+            for binding in bundle.node_bindings
+            for mechanism_id in binding.mechanism_ids
+        )
+        available.update(binding.mechanism_id for binding in bundle.edge_bindings)
+    available.update(_task_requirement_ids(program.family))
+    missing = set(program.required_mechanism_ids) - available
+    for mechanism_id in sorted(missing):
+        issues.append(_issue("task_program_mechanism", f"unknown or incompatible mechanism: {mechanism_id}"))
+    return TaskProgramValidationReport(program_id=program.program_id, issues=tuple(issues))
+
+
+def validate_nuisance_target_leakage(
+    plan: InstancePlan,
+    target_column_id: str | None,
+) -> tuple[InstanceValidationIssue, ...]:
+    """Reject an unmasked nuisance feature derived from a task target column."""
+    if target_column_id is None:
+        return ()
+    issues: list[InstanceValidationIssue] = []
+    for column_plan in plan.nuisance_plan.column_roles:
+        if (
+            column_plan.column_id != target_column_id
+            and target_column_id in column_plan.source_column_ids
+        ):
+            issues.append(
+                _issue(
+                    "nuisance_target_leakage",
+                    "nuisance feature is derived from the task target column",
+                    column_id=column_plan.column_id,
+                )
+            )
+    for missingness in plan.nuisance_plan.missingness_plans:
+        if (
+            missingness.column_id != target_column_id
+            and target_column_id in missingness.driver_column_ids
+        ):
+            issues.append(
+                _issue(
+                    "nuisance_target_leakage",
+                    "nuisance missingness is driven by the task target column",
+                    column_id=missingness.column_id,
+                )
+            )
+    return tuple(issues)
+
+
+def _validate_prior_references(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+) -> list[InstanceValidationIssue]:
+    issues: list[InstanceValidationIssue] = []
+    table_ids = {item.table_id for item in schema.tables}
+    foreign_key_ids = {item.foreign_key_id for item in schema.foreign_keys}
+    column_ids = {column.column_id for table in schema.tables for column in table.columns}
+    known_shared = {item.state_id for item in plan.shared_states}
+    known_temporal = {item.state_id for item in plan.temporal_state_plans}
+
+    bundle_ids: set[str] = set()
+    table_claims: dict[str, set[str]] = {}
+    relation_claims: dict[str, set[str]] = {}
+    for bundle in plan.motif_bundles:
+        if bundle.bundle_id in bundle_ids:
+            issues.append(_issue("duplicate_motif_bundle", "motif bundle ID is duplicated"))
+        bundle_ids.add(bundle.bundle_id)
+        for reference in (
+            bundle.attribute_mechanism,
+            bundle.relation_mechanism,
+            bundle.temporal_mechanism,
+            bundle.process_mechanism,
+        ):
+            try:
+                registered = mechanism_ref(reference.kind)
+            except ValueError:
+                issues.append(_issue("unknown_mechanism_reference", f"unknown mechanism: {reference.kind}"))
+            else:
+                if registered.version != reference.version:
+                    issues.append(_issue("mechanism_version_mismatch", f"unexpected version for mechanism: {reference.kind}"))
+        unknown_states = set(bundle.shared_state_ids) - known_shared
+        for state_id in sorted(unknown_states):
+            issues.append(_issue("unknown_shared_state", f"bundle references unknown state: {state_id}"))
+        for binding in bundle.node_bindings:
+            if binding.table_id not in table_ids:
+                issues.append(_issue("bundle_table_binding", "bundle table binding does not exist", table_id=binding.table_id))
+                continue
+            table_claims.setdefault(binding.table_id, set()).add(bundle.attribute_mechanism.kind)
+        for binding in bundle.edge_bindings:
+            if binding.foreign_key_id not in foreign_key_ids:
+                issues.append(_issue("bundle_relation_binding", "bundle FK binding does not exist", foreign_key_id=binding.foreign_key_id))
+                continue
+            relation_claims.setdefault(binding.foreign_key_id, set()).add(bundle.relation_mechanism.kind)
+    for table_id, claims in table_claims.items():
+        non_legacy = claims - {"legacy_scm"}
+        if len(non_legacy) > 1:
+            issues.append(_issue("motif_bundle_conflict", "table has conflicting attribute bundles", table_id=table_id))
+    for foreign_key_id, claims in relation_claims.items():
+        non_legacy = claims - {"latent_affinity"}
+        if len(non_legacy) > 1:
+            issues.append(_issue("motif_bundle_conflict", "relation has conflicting relation bundles", foreign_key_id=foreign_key_id))
+
+    _validate_mechanism_columns(issues, plan, column_ids, known_shared)
+    for mechanism in plan.population_mechanisms:
+        if mechanism.table_id not in table_ids:
+            issues.append(_issue("population_table_reference", "population mechanism table does not exist", table_id=mechanism.table_id))
+        if mechanism.parent_table_id is not None and mechanism.parent_table_id not in table_ids:
+            issues.append(_issue("population_parent_table_reference", "population parent table does not exist", table_id=mechanism.table_id))
+        for state_id in set(mechanism.state_ids) - known_shared:
+            issues.append(_issue("population_state_reference", f"unknown population state: {state_id}", table_id=mechanism.table_id))
+    for process in plan.temporal_processes:
+        if process.table_id not in table_ids:
+            issues.append(_issue("temporal_table_reference", "temporal process table does not exist", table_id=process.table_id))
+        for state_id in set(process.state_ids) - known_shared:
+            issues.append(_issue("temporal_state_reference", f"unknown shared state: {state_id}", table_id=process.table_id))
+        for state_id in set(process.temporal_state_ids) - known_temporal:
+            issues.append(_issue("temporal_trajectory_reference", f"unknown temporal state: {state_id}", table_id=process.table_id))
+        for column_id in set(process.covariate_column_ids) - column_ids:
+            issues.append(_issue("temporal_covariate_reference", f"unknown temporal covariate: {column_id}", table_id=process.table_id, column_id=column_id))
+    nuisance = plan.nuisance_plan
+    try:
+        registered = mechanism_ref(nuisance.mechanism.kind)
+    except ValueError:
+        issues.append(_issue("unknown_mechanism_reference", f"unknown nuisance mechanism: {nuisance.mechanism.kind}"))
+    else:
+        if registered.version != nuisance.mechanism.version:
+            issues.append(_issue("mechanism_version_mismatch", "unexpected nuisance mechanism version"))
+    for column_plan in nuisance.column_roles:
+        if column_plan.column_id not in column_ids:
+            issues.append(_issue("nuisance_column_reference", "nuisance column does not exist", column_id=column_plan.column_id))
+        for source_id in set(column_plan.source_column_ids) - column_ids:
+            issues.append(_issue("nuisance_source_reference", f"unknown nuisance source: {source_id}", column_id=column_plan.column_id))
+    return issues
+
+
+def _validate_mechanism_columns(
+    issues: list[InstanceValidationIssue],
+    plan: InstancePlan,
+    column_ids: set[str],
+    known_shared: set[str],
+) -> None:
+    graph: dict[str, tuple[str, ...]] = {}
+    for mechanism in plan.column_mechanisms:
+        if mechanism.column_id not in column_ids:
+            issues.append(_issue("column_mechanism_reference", "mechanism column does not exist", column_id=mechanism.column_id))
+            continue
+        if mechanism.column_id in graph:
+            issues.append(_issue("duplicate_column_mechanism", "multiple mechanisms target one column", column_id=mechanism.column_id))
+        graph[mechanism.column_id] = mechanism.parent_column_ids
+        for parent_id in set(mechanism.parent_column_ids) - column_ids:
+            issues.append(_issue("column_parent_reference", f"unknown parent column: {parent_id}", column_id=mechanism.column_id))
+        for state_id in set(mechanism.shared_state_ids) - known_shared:
+            issues.append(_issue("column_state_reference", f"unknown shared state: {state_id}", column_id=mechanism.column_id))
+    visiting: set[str] = set()
+    complete: set[str] = set()
+    for column_id in graph:
+        if _column_dag_cycle(column_id, graph, visiting, complete):
+            issues.append(_issue("column_dag_cycle", "column mechanism DAG contains a cycle", column_id=column_id))
+            break
+
+
+def _column_dag_cycle(
+    column_id: str,
+    graph: Mapping[str, tuple[str, ...]],
+    visiting: set[str],
+    complete: set[str],
+) -> bool:
+    if column_id in complete:
+        return False
+    if column_id in visiting:
+        return True
+    visiting.add(column_id)
+    cyclic = any(
+        parent_id in graph and _column_dag_cycle(parent_id, graph, visiting, complete)
+        for parent_id in graph[column_id]
+    )
+    visiting.remove(column_id)
+    if not cyclic:
+        complete.add(column_id)
+    return cyclic
+
+
+def _task_requirement_ids(family: str) -> set[str]:
+    requirements = {
+        "future_event_existence": {"event_count", "event_time"},
+        "history_gated_future_active": {"event_count", "event_time", "history"},
+        "history_gated_future_inactive": {"event_count", "event_time", "history"},
+        "future_event_attribute": {"event_count", "event_time", "event_attribute", "event_attributes"},
+        "temporal_aggregate": {"event_count"},
+        "interaction_response": {"interaction"},
+        "multi_hop_program": {"event_count", "relation_path"},
+    }
+    return requirements.get(family, set())
 
 
 def validate_database_instance(
@@ -369,6 +610,9 @@ def _issue(
 __all__ = [
     "InstanceValidationIssue",
     "InstanceValidationReport",
+    "TaskProgramValidationReport",
     "validate_instance_plan",
     "validate_database_instance",
+    "validate_nuisance_target_leakage",
+    "validate_task_program",
 ]

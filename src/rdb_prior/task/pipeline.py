@@ -15,7 +15,11 @@ from rdb_prior.task.artifacts import TaskArtifactWriter
 from rdb_prior.task.planner import TaskPlanner, TaskPlannerConfig
 from rdb_prior.task.program import TaskExecutor
 from rdb_prior.task.validation import validate_task
-from rdb_prior.validation.checks import validate_database_instance
+from rdb_prior.validation.checks import (
+    validate_database_instance,
+    validate_nuisance_target_leakage,
+    validate_task_program,
+)
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -300,6 +304,14 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
         executor = TaskExecutor()
         generated = []
         for program in instance_artifact.task_programs:
+            program_report = validate_task_program(
+                schema, instance_artifact.plan, program
+            )
+            if not program_report.is_valid:
+                raise ValueError(
+                    f"invalid task program {program.program_id}: "
+                    f"{[issue.code for issue in program_report.issues]}"
+                )
             task = executor.execute(
                 sample_id=instance_artifact.sample_id,
                 schema=schema,
@@ -334,6 +346,14 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
                 f"invalid task {task.plan.task_id}: "
                 f"{[issue.code for issue in report.issues]}"
             )
+        leakage_issues = validate_nuisance_target_leakage(
+            instance_artifact.plan, task.plan.target_column_id
+        )
+        if leakage_issues:
+            raise ValueError(
+                f"nuisance target leakage in {task.plan.task_id}: "
+                f"{[issue.code for issue in leakage_issues]}"
+            )
         task_runtime = runtime.child(task.plan.task_id)
         runtime_record = task_runtime.record(
             project_version=item.project_version,
@@ -353,6 +373,10 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
             task=task,
             report=report,
             task_program=programs_by_task_id.get(task.plan.task_id),
+            prior_binding=_task_prior_binding(
+                instance_artifact,
+                programs_by_task_id.get(task.plan.task_id),
+            ),
         )
         artifact_paths.append(artifact_path)
         output_entries.append(
@@ -373,6 +397,12 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
                 "prediction_type": task.plan.prediction_type.value,
                 "support_count": len(task.data.support_row_ids),
                 "query_count": len(task.data.query_row_ids),
+                "task_program_family": (
+                    None
+                    if task.plan.task_id not in programs_by_task_id
+                    else programs_by_task_id[task.plan.task_id].family
+                ),
+                "prior_family": instance_artifact.plan.prior_family,
             }
         )
     return _TaskWorkResult(
@@ -382,6 +412,25 @@ def _generate_one_database_tasks(item: _TaskWorkItem) -> _TaskWorkResult:
         output_entries=tuple(output_entries),
         task_count=len(tasks),
     )
+
+
+def _task_prior_binding(
+    instance_artifact: object,
+    program: object | None,
+) -> dict[str, object] | None:
+    if program is None:
+        return None
+    # Kept in the task artifact for reproduction; converters never receive it.
+    return {
+        "private": True,
+        "prior_plan_id": getattr(instance_artifact.plan, "prior_plan_id"),
+        "prior_composition_id": getattr(instance_artifact.plan, "prior_composition_id"),
+        "prior_family": getattr(instance_artifact.plan, "prior_family"),
+        "program_id": getattr(program, "program_id"),
+        "program_family": getattr(program, "family"),
+        "required_bundle_ids": list(getattr(program, "required_bundle_ids")),
+        "required_mechanism_ids": list(getattr(program, "required_mechanism_ids")),
+    }
 
 
 __all__ = [

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import importlib
 import importlib.util
@@ -22,7 +23,11 @@ if str(SRC_ROOT) not in sys.path:
 
 from rdb_prior.artifacts import load_schema_artifact
 from rdb_prior.compilation.compiler import PhysicalSchemaCompiler
-from rdb_prior.export.converter import RDBPFNConverter, _seconds_to_datetime
+from rdb_prior.export.converter import (
+    RDBPFNConverter,
+    _seconds_to_datetime,
+    assert_export_has_no_private_metadata,
+)
 from rdb_prior.export.pipeline import RDBPFNExportConfig, export_rdbpfn_tasks
 from rdb_prior.export.validation import validate_rdbpfn_dataset
 from rdb_prior.generation.database import DatabaseGenerator
@@ -129,6 +134,17 @@ class RDBPFNExportTests(unittest.TestCase):
                 database=database,
             )
             self.assertTrue(validate_rdbpfn_dataset(dataset).is_valid)
+            assert_export_has_no_private_metadata(dataset)
+            with self.assertRaisesRegex(ValueError, "generator-private"):
+                assert_export_has_no_private_metadata(
+                    replace(
+                        dataset,
+                        metadata={
+                            **dataset.metadata,
+                            "prior_provenance": {"private": True},
+                        },
+                    )
+                )
             # Verify that observation_rules actually filtered rows from at
             # least one Event/Detail table in the exported database.
             filtered_any = False

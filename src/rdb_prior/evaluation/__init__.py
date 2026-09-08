@@ -6,6 +6,14 @@ from .relbench import (
     RelBenchScoreResult,
     score_relbench_predictions,
 )
+from .prior_experiments import (
+    PriorExperimentCell,
+    PriorExperimentPlan,
+    PriorExperimentResult,
+    standard_mixture_plan,
+    summarize_prior_experiment,
+    write_prior_experiment_plan,
+)
 
 __all__ = [
     "RelBenchScoreConfig",
@@ -13,4 +21,10 @@ __all__ = [
     "RouterEvaluationResult",
     "evaluate_router_checkpoint",
     "score_relbench_predictions",
+    "PriorExperimentCell",
+    "PriorExperimentPlan",
+    "PriorExperimentResult",
+    "standard_mixture_plan",
+    "summarize_prior_experiment",
+    "write_prior_experiment_plan",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -26,7 +27,7 @@ from rdb_prior.generation.database import DatabaseGenerator
 from rdb_prior.generation.encoding import encode_feature_score
 from rdb_prior.generation.state import SharedStateRegistry
 from rdb_prior.generation.temporal_processes import _temporal_ticks
-from rdb_prior.instance.plan import InstancePlan
+from rdb_prior.instance.plan import ColumnMechanismPlan, InstancePlan
 from rdb_prior.instance.planner import InstancePlanner, InstancePlannerConfig
 from rdb_prior.pipeline import (
     InstancePipelineConfig,
@@ -37,6 +38,8 @@ from rdb_prior.pipeline import (
 from rdb_prior.priors.model import (
     AttributePriorKind,
     MechanismRef,
+    NuisanceColumnPlan,
+    NuisanceColumnRole,
     NuisancePlan,
     NuisancePriorKind,
     PriorCompositionPlan,
@@ -53,6 +56,11 @@ from rdb_prior.priors.planner import (
     RelationTreeConfig,
 )
 from rdb_prior.runtime import RuntimeContext
+from rdb_prior.evaluation import (
+    PriorExperimentResult,
+    standard_mixture_plan,
+    summarize_prior_experiment,
+)
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
 from rdb_prior.schema.semantics import (
     SemanticNodePlan,
@@ -65,7 +73,12 @@ from rdb_prior.schema.spec import TableRole
 from rdb_prior.task.program import TaskExecutor, TaskProgramPlanner
 from rdb_prior.task.artifacts import load_task_artifact
 from rdb_prior.task.pipeline import TaskPipelineConfig, generate_tasks
-from rdb_prior.validation.checks import validate_database_instance, validate_instance_plan
+from rdb_prior.validation.checks import (
+    validate_database_instance,
+    validate_instance_plan,
+    validate_nuisance_target_leakage,
+    validate_task_program,
+)
 
 
 class PriorFamilyTests(unittest.TestCase):
@@ -680,6 +693,117 @@ class PriorFamilyTests(unittest.TestCase):
             self.assertEqual(1, task_result.task_count)
             task_artifact = load_task_artifact(task_result.artifact_paths[0])
             self.assertEqual(instance.task_programs[0], task_artifact.task_program)
+            self.assertIsNotNone(instance.prior_provenance)
+            assert instance.prior_provenance is not None
+            self.assertTrue(instance.prior_provenance["private"])
+            self.assertEqual(
+                PriorFamily.TEMPORAL_EVENT.value,
+                instance.prior_provenance["prior_family"],
+            )
+            self.assertEqual(
+                0,
+                instance.prior_provenance["materialization"]["retry_count"],
+            )
+            self.assertEqual(
+                instance.plan.prior_plan_id,
+                task_artifact.prior_binding["prior_plan_id"],
+            )
+            instance_manifest = json.loads(
+                instance_result.manifest_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(2, instance_manifest["artifact_version"])
+            self.assertIn("temporal_prior_counts", instance_manifest["statistics"])
+            task_manifest = json.loads(task_result.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(2, task_manifest["artifact_version"])
+            self.assertEqual(
+                {instance.task_programs[0].family: 1},
+                task_manifest["statistics"]["task_program_counts"],
+            )
+
+    def test_pr11_rejects_invalid_column_and_task_program_references(self) -> None:
+        runtime, schema, prior, plan, _database = self._temporal_fixture()
+        column_id = next(
+            column.column_id
+            for table in schema.tables
+            for column in table.columns
+            if column.kind is ColumnKind.FEATURE
+        )
+        cyclic = replace(
+            plan,
+            column_mechanisms=(
+                ColumnMechanismPlan(
+                    column_id=column_id,
+                    family="linear",
+                    parent_column_ids=(column_id,),
+                ),
+            ),
+        )
+        report = validate_instance_plan(schema, cyclic)
+        self.assertIn("column_dag_cycle", {item.code for item in report.issues})
+        program = TaskProgramPlanner().plan(
+            schema=schema,
+            instance_plan=plan,
+            prior_plan=prior,
+            runtime=runtime.child("task-program"),
+        )[0]
+        invalid = replace(program, required_bundle_ids=("missing_bundle",))
+        validation = validate_task_program(schema, plan, invalid)
+        self.assertFalse(validation.is_valid)
+        self.assertIn("task_program_bundle", {item.code for item in validation.issues})
+        target_column_id = next(
+            column.column_id
+            for table in schema.tables
+            for column in table.columns
+            if column.kind is ColumnKind.FEATURE and column.column_id != column_id
+        )
+        leaking = replace(
+            plan,
+            nuisance_plan=NuisancePlan(
+                mechanism=MechanismRef(kind=NuisancePriorKind.PROXY.value, version="v1"),
+                enabled=True,
+                column_roles=(
+                    NuisanceColumnPlan(
+                        column_id=column_id,
+                        role=NuisanceColumnRole.PROXY,
+                        source_column_ids=(target_column_id,),
+                    ),
+                ),
+            ),
+        )
+        leakage = validate_nuisance_target_leakage(leaking, target_column_id)
+        self.assertEqual("nuisance_target_leakage", leakage[0].code)
+
+    def test_pr11_experiment_grid_records_generalization_and_complementarity(self) -> None:
+        experiment = standard_mixture_plan(
+            experiment_id="pr11",
+            database_count=2,
+            tasks_per_database=3,
+            training_budget=10,
+            seeds=(7,),
+        )
+        self.assertEqual(7, len(experiment.cells))
+        result = summarize_prior_experiment(
+            experiment,
+            (
+                PriorExperimentResult(
+                    train_cell_id="scm",
+                    test_cell_id="tree",
+                    seed=7,
+                    metrics=(("auc", 0.7),),
+                    error_ids=("a", "b"),
+                ),
+                PriorExperimentResult(
+                    train_cell_id="tree",
+                    test_cell_id="tree",
+                    seed=7,
+                    metrics=(("auc", 0.8),),
+                    error_ids=("b", "c"),
+                ),
+            ),
+            metric="auc",
+        )
+        self.assertEqual(0.7, result["train_test_matrix"]["scm"]["tree"])
+        self.assertIn("tree:scm|tree", result["error_complementarity"])
 
 
 if __name__ == "__main__":

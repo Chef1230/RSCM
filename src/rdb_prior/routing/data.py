@@ -241,7 +241,7 @@ def load_routing_task_references(
     payload = json.loads(Path(task_manifest).read_text(encoding="utf-8"))
     if payload.get("artifact_type") != "relational_task_manifest":
         raise ValueError("input is not a relational task manifest")
-    if payload.get("artifact_version") != 1:
+    if payload.get("artifact_version") not in {1, 2}:
         raise ValueError("unsupported relational task manifest version")
     entries = payload.get("entries")
     if not isinstance(entries, list):

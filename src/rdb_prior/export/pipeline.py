@@ -153,7 +153,7 @@ def export_rdbpfn_tasks(
     manifest = json.loads(config.task_manifest.read_text(encoding="utf-8"))
     if manifest.get("artifact_type") != "relational_task_manifest":
         raise ValueError("input is not a relational task manifest")
-    if manifest.get("artifact_version") != 1:
+    if manifest.get("artifact_version") not in {1, 2}:
         raise ValueError("unsupported relational task manifest version")
     entries = manifest.get("entries")
     if not isinstance(entries, list):

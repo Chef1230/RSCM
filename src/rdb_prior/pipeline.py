@@ -17,6 +17,7 @@ from typing import Callable
 from rdb_prior.artifacts import (
     InstanceArtifactWriter,
     SchemaArtifactWriter,
+    build_instance_provenance,
     load_schema_artifact,
 )
 from rdb_prior.compilation.compiler import PhysicalCompilerConfig
@@ -39,6 +40,7 @@ from rdb_prior.schema.validation import validate_blueprint
 from rdb_prior.validation.checks import (
     validate_database_instance,
     validate_instance_plan,
+    validate_task_program,
 )
 from rdb_prior.task.pipeline import (
     TaskPipelineConfig,
@@ -792,6 +794,13 @@ def _generate_one_database_instance(
                 raise ValueError(
                     f"invalid instance plan: {[issue.code for issue in plan_report.issues]}"
                 )
+            for program in task_programs:
+                program_report = validate_task_program(schema, plan, program)
+                if not program_report.is_valid:
+                    raise ValueError(
+                        "invalid task program: "
+                        f"{[issue.code for issue in program_report.issues]}"
+                    )
             materialization = DatabaseGenerator().materialize(schema=schema, plan=plan)
             plan = materialization.plan
             database = materialization.database
@@ -850,6 +859,15 @@ def _generate_one_database_instance(
             if item.persist_private_state_trajectory
             else None
         ),
+        materialization_retry_count=attempt,
+    )
+    provenance = build_instance_provenance(
+        schema=schema,
+        plan=plan,
+        database=database,
+        prior_plan=prior_plan,
+        task_programs=task_programs,
+        materialization_retry_count=attempt,
     )
     row_count = sum(table.row_count for table in database.tables)
     return _InstanceWorkResult(
@@ -872,6 +890,11 @@ def _generate_one_database_instance(
                 )
             ),
             "prior_family": plan.prior_family,
+            "prior_component_counts": provenance["component_counts"],
+            "materialization_retry_count": attempt,
+            "realized_distribution_statistics": provenance["materialization"][
+                "realized_distribution_statistics"
+            ],
         },
     )
 
