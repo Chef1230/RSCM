@@ -1,0 +1,267 @@
+# Prior-v2 Config 6: large-scale heterogeneous relational generation.
+# Structural, physical-design and instance settings mirror the original
+# config_6 preset; the prior block adds the v2 mechanism/provenance layer.
+config_version: 1
+seed: 41
+
+paths:
+  output_root: outputs/prior_v2_config6
+
+generation:
+  num_schemas: 50000
+  start_index: 0
+  sample_id_prefix: sample
+  progress_every: 100
+  overwrite: true
+  project_version: schema-pipeline-v6
+
+# Keep the real-data-oriented graph density from the template while retaining
+# the full motif vocabulary, including collider and fork structures.
+schema:
+  min_tables: 3
+  max_tables: 15
+  # Explicitly preserve the original template's table-count prior.
+  table_count_values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  table_count_weights: [0.20, 0.12, 0.16, 0.14, 0.12, 0.10, 0.06, 0.03, 0.02, 0.02, 0.015, 0.005, 0.01]
+  max_extra_edges: 2
+  extra_edge_probability: 0.35
+  min_motif_occurrences: 1
+  max_motif_occurrences: 4
+  background_attachment_probability: 0.35
+
+motifs:
+  weights:
+    entity_event: 1.00
+    entity_event_detail: 1.25
+    entity_bridge_collider: 1.00
+    entity_event_collider: 1.00
+    entity_event_fork: 1.00
+    event_reference_chain: 0.80
+    lookup_assignment: 0.90
+
+# The table-count tier sets the broad column-density prior.  Role overrides
+# take precedence, preserving the original config_6 physical-schema shape:
+# entities can be wide; bridges remain deliberately narrow.
+physical_design:
+  schema_id_prefix: schema
+  min_feature_columns: 2
+  max_feature_columns: 6
+  feature_nullable_probability: 0.35
+  primary_key_names: [id, pk_id, row_id]
+
+  feature_columns_by_table_count:
+    - {table_count_min: 3, table_count_max: 5, min_columns: 6, max_columns: 15}
+    - {table_count_min: 6, table_count_max: 8, min_columns: 4, max_columns: 10}
+    - {table_count_min: 9, table_count_max: 12, min_columns: 3, max_columns: 8}
+    - {table_count_min: 13, table_count_max: 15, min_columns: 2, max_columns: 6}
+
+  feature_columns_by_role:
+    entity: {min_columns: 4, max_columns: 16}
+    event: {min_columns: 3, max_columns: 12}
+    lookup: {min_columns: 2, max_columns: 6}
+    bridge: {min_columns: 1, max_columns: 6}
+    detail: {min_columns: 2, max_columns: 10}
+
+instance:
+  # Keep the heavy-tailed role-conditioned scale, but use the current
+  # bounded production limits so the 6,500-DB run remains reproducible.
+  entity_rows_min: 100
+  entity_rows_max: 20000
+  entity_rows_distribution: lognormal
+  entity_rows_median: 1500
+  entity_rows_log_sigma: 1.15
+  lookup_rows_min: 3
+  lookup_rows_max: 200
+  lookup_rows_distribution: loguniform
+  event_fanout_min: 0.10
+  event_fanout_max: 30.0
+  bridge_rows_factor_min: 0.05
+  bridge_rows_factor_max: 8.0
+  detail_fanout_min: 0.20
+  detail_fanout_max: 12.0
+  entity_child_factor_min: 0.15
+  entity_child_factor_max: 3.0
+  population_scale_distribution: lognormal
+  population_scale_log_sigma: 1.0
+  max_rows_per_table: 50000
+
+  optional_rate_min: 0.0
+  optional_rate_max: 0.40
+
+  # A lower high-cardinality tail than the broad template default, centered
+  # around the low-cardinality regime used by RDBPFN-style inputs.
+  categorical_cardinality_min: 2
+  categorical_cardinality_max: 16
+  categorical_high_cardinality_probability: 0.08
+  categorical_high_cardinality_min: 17
+  categorical_high_cardinality_max: 512
+
+  # Local override of the template defaults.  Current code uses these for the
+  # Softmax(signal logits + log Dirichlet prior) categorical path.
+  categorical_dirichlet_alpha_min: 0.25
+  categorical_dirichlet_alpha_max: 2.00
+  categorical_signal_strength_min: 0.75
+  categorical_signal_strength_max: 1.75
+
+  # Balanced calendar mechanisms; churn remains visible without making every
+  # event table look like a benchmark-specific churn generator.
+  event_temporal_mechanism_weights:
+    stationary: 0.25
+    burst: 0.30
+    churn: 0.30
+    seasonal: 0.15
+
+instance_generation:
+  count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  num_workers: 48
+  progress_every: 100
+  overwrite: true
+  project_version: instance-pipeline-v6
+
+task:
+  tasks_per_database: 2
+  # Sum is 1.0.  The two history-gated mechanisms receive enough mass to
+  # expose churn/retention behavior while relation and aggregate tasks remain
+  # the majority of the task family.
+  mechanism_weights:
+    relation_attribute: 0.20
+    entity_future_event_existence: 0.15
+    history_gated_future_inactive: 0.15
+    history_gated_future_active: 0.10
+    future_event_attribute_condition: 0.15
+    temporal_relational_aggregate: 0.10
+    interaction_response: 0.15
+
+  support_fraction: 0.70
+  min_support_rows: 32
+  min_query_rows: 16
+  min_class_count_per_split: 2
+  max_classification_categories: 12
+  cutoff_quantile_min: 0.40
+  cutoff_quantile_max: 0.72
+  horizon_fraction_min: 0.08
+  horizon_fraction_max: 0.25
+  positive_rate_min: 0.20
+  positive_rate_max: 0.80
+  max_attempts_per_database: 192
+  require_full_task_count: true
+
+task_generation:
+  database_count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  progress_every: 100
+  overwrite: false
+  project_version: task-pipeline-v6
+
+rdbpfn_export:
+  task_count: null
+  start_index: 0
+  shard_id: 0
+  num_shards: 1
+  validation_fraction: 0.20
+  min_validation_rows: 8
+  compress: true
+  progress_every: 100
+  overwrite: true
+  project_version: rdbpfn-export-v6
+
+  # Keep H5/DFS packaging opt-in for this generation run.  When enabled, use
+  # DFS-2 explicitly; the current exporter does not mix DFS-1 and DFS-2 in one
+  # H5 artifact.
+  h5_enabled: true
+  h5_run_dfs: true
+  dfs_depth: 2
+  dfs_jobs: 64
+  h5_total_rows: 600
+  h5_max_columns: 80
+  h5_seed: 42
+
+# Database-level mixture.  Complex schemas that do not contain one eligible
+# Entity -> Event occurrence safely fall back to SCM/tree/legacy families.
+prior:
+  mode: compositional
+  database_family_weights:
+    legacy_role_scm: 0.10
+    relational_scm: 0.30
+    relational_tree: 0.20
+    temporal_event: 0.25
+    rule_process: 0.15
+
+  shared_state:
+    family: gaussian_mixture
+    dimension: 4
+
+  temporal_state:
+    enabled: true
+    state_space:
+      values: [active, inactive, under_review, blocked]
+      terminal_states: [blocked]
+    initial_state:
+      family: state_conditioned_softmax
+    transition:
+      clock: hybrid
+      family: state_conditioned_softmax
+    duration:
+      family: exponential
+      state_conditioned: true
+    visibility:
+      family: hidden
+
+  task_policy:
+    require_family_compatibility: true
+    sample_program_before_data: true
+    posthoc_horizon_selection: false
+    programs_per_database: 2
+    max_materialization_attempts: 8
+    cutoff_fraction_min: 0.40
+    cutoff_fraction_max: 0.72
+    horizon_fraction_min: 0.08
+    horizon_fraction_max: 0.25
+    positive_rate_min: 0.20
+    positive_rate_max: 0.80
+
+  relational_scm:
+    column_dag_depth: [1, 4]
+    parent_count: [1, 5]
+    mechanisms:
+      exogenous: 0.15
+      linear: 0.35
+      cam: 0.30
+      mlp: 0.20
+    relation_mechanisms:
+      scm_logistic_propensity: 0.40
+      scm_softmax_affinity: 0.30
+      scm_cpt: 0.15
+      scm_community: 0.15
+    population_mechanisms:
+      poisson: 0.25
+      negative_binomial: 0.55
+      zero_inflated_negative_binomial: 0.20
+
+  relational_tree:
+    tree_count: [1, 8]
+    depth: [2, 6]
+    threshold_strategy: extra
+    use_for_attributes: true
+    use_for_event_intensity: true
+    use_for_relation_propensity: true
+
+  rule_process:
+    enabled: true
+    condition_probability: 0.65
+    intensity_multiplier_min: 1.25
+    intensity_multiplier_max: 2.25
+    attribute_offset_min: 0.15
+    attribute_offset_max: 0.75
+
+  nuisance:
+    enabled: false
+    kind: legacy
+
+debug:
+  persist_private_state_trajectory: false
