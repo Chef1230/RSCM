@@ -251,6 +251,15 @@ def _optional_identifier_tuple(name: str, values: object) -> None:
         raise ValueError(f"{name} must not contain duplicates")
 
 
+def _require_unique_state_owners(
+    states: tuple[SharedStatePlan, ...] | tuple[TemporalStatePlan, ...],
+    label: str,
+) -> None:
+    owners = [item.owner_table_id for item in states]
+    if len(set(owners)) != len(owners):
+        raise ValueError(f"{label} owners must be unique")
+
+
 def _seed(name: str, value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
@@ -547,6 +556,11 @@ class TaskPolicyPlan:
     sample_program_before_data: bool = True
     posthoc_horizon_selection: bool = False
     max_materialization_attempts: int = 8
+    support_fraction: float = 0.7
+    min_support_rows: int = 8
+    min_query_rows: int = 4
+    min_total_rows: int | None = 12
+    min_class_count_per_split: int = 1
     cutoff_fraction_min: float = 0.45
     cutoff_fraction_max: float = 0.70
     horizon_fraction_min: float = 0.12
@@ -559,10 +573,30 @@ class TaskPolicyPlan:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be positive")
+        for name in ("min_support_rows", "min_query_rows", "min_class_count_per_split"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.min_total_rows is not None:
+            if (
+                isinstance(self.min_total_rows, bool)
+                or not isinstance(self.min_total_rows, int)
+                or self.min_total_rows < 1
+            ):
+                raise ValueError("min_total_rows must be a positive integer or None")
+            if self.min_total_rows < self.min_support_rows + self.min_query_rows:
+                raise ValueError(
+                    "min_total_rows must be at least min_support_rows + min_query_rows"
+                )
         for name in ("require_family_compatibility", "sample_program_before_data", "posthoc_horizon_selection"):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"{name} must be a bool")
-        for low, high, name in ((self.cutoff_fraction_min, self.cutoff_fraction_max, "cutoff"), (self.horizon_fraction_min, self.horizon_fraction_max, "horizon"), (self.positive_rate_min, self.positive_rate_max, "positive rate")):
+        for low, high, name in (
+            (self.support_fraction, self.support_fraction, "support"),
+            (self.cutoff_fraction_min, self.cutoff_fraction_max, "cutoff"),
+            (self.horizon_fraction_min, self.horizon_fraction_max, "horizon"),
+            (self.positive_rate_min, self.positive_rate_max, "positive rate"),
+        ):
             if not 0 < low <= high < 1:
                 raise ValueError(f"{name} range must satisfy 0 < low <= high < 1")
 
@@ -839,10 +873,12 @@ class PriorCompositionPlan:
             self.shared_states
         ):
             raise ValueError("shared state IDs must be unique")
+        _require_unique_state_owners(self.shared_states, "shared state")
         if len({item.state_id for item in self.temporal_states}) != len(
             self.temporal_states
         ):
             raise ValueError("temporal state IDs must be unique")
+        _require_unique_state_owners(self.temporal_states, "temporal state")
         known_shared = {item.state_id for item in self.shared_states}
         if any(
             item.shared_state_id not in known_shared
@@ -935,10 +971,12 @@ class DatabasePriorPlan:
         _seed("seed", self.seed)
         if len({item.state_id for item in self.shared_states}) != len(self.shared_states):
             raise ValueError("shared state IDs must be unique")
+        _require_unique_state_owners(self.shared_states, "shared state")
         if len({item.state_id for item in self.temporal_states}) != len(
             self.temporal_states
         ):
             raise ValueError("temporal state IDs must be unique")
+        _require_unique_state_owners(self.temporal_states, "temporal state")
         known_shared = {item.state_id for item in self.shared_states}
         if any(item.shared_state_id not in known_shared for item in self.temporal_states):
             raise ValueError("temporal states must reference shared states")

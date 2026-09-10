@@ -15,7 +15,7 @@ from rdb_prior.compilation.model import (
 from rdb_prior.generation.model import DatabaseInstance
 from rdb_prior.instance.plan import InstancePlan
 from rdb_prior.priors.registry import mechanism_ref
-from rdb_prior.schema.spec import Optionality
+from rdb_prior.schema.spec import Optionality, TableRole
 from rdb_prior.task.program import TaskProgramPlan
 
 
@@ -256,6 +256,76 @@ def _validate_prior_references(
     column_ids = {column.column_id for table in schema.tables for column in table.columns}
     known_shared = {item.state_id for item in plan.shared_states}
     known_temporal = {item.state_id for item in plan.temporal_state_plans}
+    shared_by_id = {item.state_id: item for item in plan.shared_states}
+
+    shared_owner_ids: set[str] = set()
+    for state in plan.shared_states:
+        if state.owner_table_id not in table_ids:
+            issues.append(
+                _issue(
+                    "shared_state_owner_reference",
+                    "shared state owner table does not exist",
+                    table_id=state.owner_table_id,
+                )
+            )
+        else:
+            owner = schema.table(state.owner_table_id)
+            if owner.role is not TableRole.ENTITY:
+                issues.append(
+                    _issue(
+                        "shared_state_owner_role",
+                        "shared state owner must be an Entity table",
+                        table_id=state.owner_table_id,
+                    )
+                )
+        if state.owner_table_id in shared_owner_ids:
+            issues.append(
+                _issue(
+                    "duplicate_shared_state_owner",
+                    "an Entity table may own only one shared state",
+                    table_id=state.owner_table_id,
+                )
+            )
+        shared_owner_ids.add(state.owner_table_id)
+
+    temporal_owner_ids: set[str] = set()
+    for state in plan.temporal_state_plans:
+        if state.owner_table_id not in table_ids:
+            issues.append(
+                _issue(
+                    "temporal_state_owner_reference",
+                    "temporal state owner table does not exist",
+                    table_id=state.owner_table_id,
+                )
+            )
+        else:
+            owner = schema.table(state.owner_table_id)
+            if owner.role is not TableRole.ENTITY:
+                issues.append(
+                    _issue(
+                        "temporal_state_owner_role",
+                        "temporal state owner must be an Entity table",
+                        table_id=state.owner_table_id,
+                    )
+                )
+        if state.owner_table_id in temporal_owner_ids:
+            issues.append(
+                _issue(
+                    "duplicate_temporal_state_owner",
+                    "an Entity table may own only one temporal state",
+                    table_id=state.owner_table_id,
+                )
+            )
+        temporal_owner_ids.add(state.owner_table_id)
+        shared = shared_by_id.get(state.shared_state_id)
+        if shared is not None and shared.owner_table_id != state.owner_table_id:
+            issues.append(
+                _issue(
+                    "temporal_shared_state_owner_mismatch",
+                    "temporal state and shared state must have the same Entity owner",
+                    table_id=state.owner_table_id,
+                )
+            )
 
     bundle_ids: set[str] = set()
     table_claims: dict[str, set[str]] = {}

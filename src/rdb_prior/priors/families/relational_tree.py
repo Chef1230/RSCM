@@ -22,6 +22,7 @@ def bind_relational_tree_plan(
     if prior_plan.family is not PriorFamily.RELATIONAL_TREE:
         raise ValueError("relational-tree binder requires relational_tree prior")
     relation_forests: dict[str, ForestPlan] = {}
+    relation_families: dict[str, str] = {}
     attribute_forests: dict[str, ForestPlan] = {}
     for bundle in prior_plan.motif_bundles:
         if bundle.family is not PriorFamily.RELATIONAL_TREE:
@@ -31,6 +32,8 @@ def bind_relational_tree_plan(
             parameters.get("relation_forests", {})
         ).items():
             relation_forests[str(foreign_key_id)] = ForestPlan.from_dict(payload)
+        for edge in bundle.edge_bindings:
+            relation_families[edge.foreign_key_id] = edge.mechanism_id
         for column_id, payload in dict(
             parameters.get("attribute_forests", {})
         ).items():
@@ -39,11 +42,16 @@ def bind_relational_tree_plan(
     relations = tuple(
         replace(
             relation,
-            family="tree_propensity",
-            tree_forest=relation_forests[relation.foreign_key_ids[0]],
+            family=relation_families.get(
+                relation.foreign_key_ids[0], "tree_propensity"
+            ),
+            tree_forest=relation_forests.get(relation.foreign_key_ids[0]),
         )
         if len(relation.foreign_key_ids) == 1
-        and relation.foreign_key_ids[0] in relation_forests
+        and (
+            relation.foreign_key_ids[0] in relation_forests
+            or relation.foreign_key_ids[0] in relation_families
+        )
         else relation
         for relation in plan.relations
     )

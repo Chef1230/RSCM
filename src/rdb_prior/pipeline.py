@@ -763,14 +763,22 @@ def _generate_one_database_instance(
             semantic_schema=semantic_schema,
             runtime=runtime.child("prior"),
         )
+    # Legacy plans preserve their original single-shot seed path. Every
+    # executable v2 family may reject a materialization when a conditional
+    # population/count falls outside its declared bounds. Keep the sampled
+    # prior/program fixed and use the bounded materialization-only seed stream
+    # for those retries instead of aborting the batch on the first rejection.
     attempts = 1
-    if prior_plan is not None and prior_plan.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
-        attempts = prior_plan.task_policy.max_materialization_attempts
+    if prior_plan is not None and prior_plan.family is not PriorFamily.LEGACY_ROLE_SCM:
+        attempts = max(1, prior_plan.task_policy.max_materialization_attempts)
 
     last_error: ValueError | None = None
+    task_programs = ()
     for attempt in range(attempts):
         # The original seed path is intentionally preserved for legacy plans.
-        # Temporal retries get an explicitly derived, materialization-only seed.
+        # V2 retries jointly resample the instance materialization and the
+        # pre-data task programs. Each program is still sampled before rows are
+        # materialized; a failed joint draw is rejected as a whole.
         attempt_runtime = runtime if attempt == 0 else runtime.child("materialization-retry", attempt)
         try:
             plan = InstancePlanner(item.planner_config).plan(
@@ -782,7 +790,7 @@ def _generate_one_database_instance(
             task_programs = ()
             if prior_plan is not None and prior_plan.family in {PriorFamily.TEMPORAL_EVENT, PriorFamily.RULE_PROCESS}:
                 # Programs are sampled from the plan calendar before any rows are
-                # materialized.  They are never calibrated from realized labels.
+                # materialized. They are not calibrated from realized labels.
                 task_programs = TaskProgramPlanner().plan(
                     schema=schema,
                     instance_plan=plan,
@@ -812,18 +820,22 @@ def _generate_one_database_instance(
             if task_programs:
                 policy = prior_plan.task_policy
                 executor = TaskExecutor()
-                if any(
-                    executor.execute(
+                invalid_programs = []
+                for program in task_programs:
+                    if executor.execute(
                         sample_id=artifact.sample_id,
                         schema=schema,
                         database=database,
                         program=program,
                         positive_rate_min=policy.positive_rate_min,
                         positive_rate_max=policy.positive_rate_max,
-                    ) is None
-                    for program in task_programs
-                ):
-                    raise ValueError("pre-sampled task program failed post-materialization validation")
+                    ) is None:
+                        invalid_programs.append(program.program_id)
+                if invalid_programs:
+                    raise ValueError(
+                        "pre-sampled task program(s) failed post-materialization "
+                        f"validation: {invalid_programs}"
+                    )
             break
         except ValueError as error:
             last_error = error

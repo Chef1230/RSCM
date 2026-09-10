@@ -40,7 +40,12 @@ def generate_relations(
                 relation,
                 child_rows=child_rows,
                 latents=latents,
-                population_counts=population_counts.get(relation.child_table_id),
+                population_counts=(
+                    None
+                    if relation.family.startswith("scm_")
+                    or relation.family == "tree_propensity"
+                    else population_counts.get(relation.child_table_id)
+                ),
             )
         overlap = set(values) & set(generated)
         if overlap:

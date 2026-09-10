@@ -213,6 +213,7 @@ class TaskProgramPlan:
     support_fraction: float = 0.7
     min_support_rows: int = 8
     min_query_rows: int = 4
+    min_total_rows: int | None = 12
     min_class_count_per_split: int = 1
     expression: LabelExpression | None = None
     cutoff_policy: CutoffPolicy | None = None
@@ -278,6 +279,17 @@ class TaskProgramPlan:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.min_total_rows is not None:
+            if (
+                isinstance(self.min_total_rows, bool)
+                or not isinstance(self.min_total_rows, int)
+                or self.min_total_rows < 1
+            ):
+                raise ValueError("min_total_rows must be a positive integer or None")
+            if self.min_total_rows < self.min_support_rows + self.min_query_rows:
+                raise ValueError(
+                    "min_total_rows must be at least min_support_rows + min_query_rows"
+                )
         if self.attribute_column_id is not None and not isinstance(
             self.attribute_column_id, str
         ):
@@ -307,6 +319,7 @@ class TaskProgramPlan:
             "support_fraction": self.support_fraction,
             "min_support_rows": self.min_support_rows,
             "min_query_rows": self.min_query_rows,
+            "min_total_rows": self.min_total_rows,
             "min_class_count_per_split": self.min_class_count_per_split,
             "expression": None if self.expression is None else self.expression.to_dict(),
             "cutoff_policy": None if self.cutoff_policy is None else self.cutoff_policy.to_dict(),
@@ -343,6 +356,7 @@ class TaskProgramPlan:
             support_fraction=data.get("support_fraction", 0.7),
             min_support_rows=data.get("min_support_rows", 8),
             min_query_rows=data.get("min_query_rows", 4),
+            min_total_rows=data.get("min_total_rows", 12),
             min_class_count_per_split=data.get("min_class_count_per_split", 1),
             expression=None if expression is None else LabelExpression.from_dict(expression),
             cutoff_policy=None if cutoff_policy is None else CutoffPolicy.from_dict(cutoff_policy),
@@ -466,6 +480,11 @@ class TaskProgramPlanner:
                     required_mechanism_ids=tuple(required),
                     seed=runtime.seed("task-program", index),
                     prior_plan_id=prior_plan.plan_id,
+                    support_fraction=policy.support_fraction,
+                    min_support_rows=policy.min_support_rows,
+                    min_query_rows=policy.min_query_rows,
+                    min_total_rows=policy.min_total_rows,
+                    min_class_count_per_split=policy.min_class_count_per_split,
                     expression=LabelExpression(kind=family, args=args),
                     cutoff_policy=CutoffPolicy(
                         family="calendar_fraction",
@@ -596,6 +615,11 @@ class TaskExecutor:
         valid_mask = labels >= 0
         valid_indices = np.flatnonzero(valid_mask).astype(np.int64)
         if not len(valid_indices):
+            return None
+        if (
+            program.min_total_rows is not None
+            and len(valid_indices) < program.min_total_rows
+        ):
             return None
         valid_labels = np.asarray(labels[valid_mask], dtype=np.int8)
         positive_rate = float(np.mean(valid_labels))

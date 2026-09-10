@@ -110,18 +110,36 @@ class TableSemanticPlan:
 class ColumnSemanticPlan:
     column_id: str
     role: ColumnSemanticRole
+    semantic_column_id: str | None = None
+    physical_column_id: str | None = None
 
     def __post_init__(self) -> None:
         _identifier("column_id", self.column_id)
         if not isinstance(self.role, ColumnSemanticRole):
             raise TypeError("role must be ColumnSemanticRole")
+        semantic_id = self.semantic_column_id or f"semantic_{self.column_id}"
+        physical_id = self.physical_column_id or self.column_id
+        _identifier("semantic_column_id", semantic_id)
+        _identifier("physical_column_id", physical_id)
+        object.__setattr__(self, "semantic_column_id", semantic_id)
+        object.__setattr__(self, "physical_column_id", physical_id)
 
     def to_dict(self) -> dict[str, str]:
-        return {"column_id": self.column_id, "role": self.role.value}
+        return {
+            "column_id": self.column_id,
+            "semantic_column_id": self.semantic_column_id,
+            "physical_column_id": self.physical_column_id,
+            "role": self.role.value,
+        }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ColumnSemanticPlan":
-        return cls(column_id=data["column_id"], role=ColumnSemanticRole(data["role"]))
+        return cls(
+            column_id=data["column_id"],
+            role=ColumnSemanticRole(data["role"]),
+            semantic_column_id=data.get("semantic_column_id"),
+            physical_column_id=data.get("physical_column_id"),
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -154,6 +172,10 @@ class SemanticSchemaPlan:
             raise ValueError("table semantic IDs must be unique")
         if len({item.column_id for item in self.columns}) != len(self.columns):
             raise ValueError("column semantic IDs must be unique")
+        if len({item.semantic_column_id for item in self.columns}) != len(self.columns):
+            raise ValueError("semantic column IDs must be unique")
+        if len({item.physical_column_id for item in self.columns}) != len(self.columns):
+            raise ValueError("physical column bindings must be unique")
         if len({item.node_id for item in self.nodes}) != len(self.nodes):
             raise ValueError("semantic node IDs must be unique")
         table_ids = {item.table_id for item in self.tables}
@@ -186,7 +208,11 @@ class SemanticSchemaPlan:
 
     def column_role(self, column_id: str) -> ColumnSemanticRole:
         for item in self.columns:
-            if item.column_id == column_id:
+            if column_id in {
+                item.column_id,
+                item.semantic_column_id,
+                item.physical_column_id,
+            }:
                 return item.role
         raise KeyError(column_id)
 
@@ -340,6 +366,8 @@ def sample_semantic_schema(
             role=_column_role(
                 column.kind, column.data_type, runtime, column.column_id
             ),
+            semantic_column_id=f"semantic_{column.column_id}",
+            physical_column_id=column.column_id,
         )
         for table in source.tables
         for column in table.columns
@@ -358,9 +386,13 @@ def complete_semantic_schema(
     logical: SemanticSchemaPlan,
     schema: PhysicalSchema,
 ) -> SemanticSchemaPlan:
-    """Bind logical column roles to the compiled anonymous columns by ordinal."""
+    """Bind logical roles to physical columns without consuming built-ins."""
     role_by_table = {item.table_id: item.role for item in logical.tables}
     node_by_table = {item.node_id: item for item in logical.nodes}
+    logical_by_column = {
+        item.physical_column_id or item.column_id: item
+        for item in logical.columns
+    }
     columns: list[ColumnSemanticPlan] = []
     for table in schema.tables:
         node = node_by_table.get(table.table_id)
@@ -369,19 +401,49 @@ def complete_semantic_schema(
             if node is not None
             else []
         )
-        feature_index = 0
+        builtin_features = {
+            TableRole.LOOKUP: 2,
+            TableRole.DETAIL: 1,
+        }.get(table.role, 0)
+        feature_ordinal = 0
+        planned_index = 0
+        semantic_index = 0
         for column in table.columns:
             if column.kind in {ColumnKind.PRIMARY_KEY, ColumnKind.FOREIGN_KEY}:
                 continue
             if column.kind is ColumnKind.TIME:
                 role = ColumnSemanticRole.TIMESTAMP
-            elif feature_index < len(planned):
-                role = planned[feature_index]
-                feature_index += 1
+            elif feature_ordinal < builtin_features:
+                role = (
+                    ColumnSemanticRole.CATEGORY
+                    if table.role is TableRole.LOOKUP and feature_ordinal == 0
+                    else ColumnSemanticRole.STATIC_ATTRIBUTE
+                )
+                feature_ordinal += 1
+            elif planned_index < len(planned):
+                role = planned[planned_index]
+                planned_index += 1
+                feature_ordinal += 1
             else:
                 role = ColumnSemanticRole.STATIC_ATTRIBUTE
-                feature_index += 1
-            columns.append(ColumnSemanticPlan(column_id=column.column_id, role=role))
+                feature_ordinal += 1
+            existing = logical_by_column.get(column.column_id)
+            semantic_id = (
+                existing.semantic_column_id
+                if existing is not None
+                else f"semantic_{table.table_id}_{semantic_index:03d}"
+            )
+            if existing is not None:
+                role = existing.role
+            columns.append(
+                ColumnSemanticPlan(
+                    column_id=column.column_id,
+                    role=role,
+                    semantic_column_id=semantic_id,
+                    physical_column_id=column.column_id,
+                )
+            )
+            semantic_index += 1
     return SemanticSchemaPlan(
         schema_id=schema.schema_id,
         prototype_id=logical.prototype_id,

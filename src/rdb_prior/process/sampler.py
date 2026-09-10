@@ -8,6 +8,7 @@ from typing import Any
 from rdb_prior.compilation.model import ColumnKind, PhysicalDataType, PhysicalSchema
 from rdb_prior.process.model import ColumnRef, Compare, Constant, RuleAction, RulePlan
 from rdb_prior.runtime import RuntimeContext
+from rdb_prior.schema.semantics import SemanticSchemaPlan
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -55,11 +56,25 @@ class RuleProcessSampler:
         foreign_key_id: str,
         runtime: RuntimeContext,
         state_id: str | None = None,
+        semantic_schema: SemanticSchemaPlan | None = None,
     ) -> RulePlan:
         if not self.config.enabled:
             raise ValueError("rule process prior is disabled")
         entity = schema.table(entity_table_id)
-        feature = next((column for column in entity.columns if column.kind is ColumnKind.FEATURE), None)
+        feature = next(
+            (
+                column
+                for column in entity.columns
+                if column.kind is ColumnKind.FEATURE
+                and semantic_schema is not None
+                and semantic_schema.column_role(column.column_id).value
+                in {"state", "static_attribute", "amount", "measurement"}
+            ),
+            None,
+        ) or next(
+            (column for column in entity.columns if column.kind is ColumnKind.FEATURE),
+            None,
+        )
         if feature is None:
             # A constant rule is still useful for schemas with key-only parents.
             condition = Compare("=", Constant(1), Constant(1))
@@ -97,6 +112,12 @@ class RuleProcessSampler:
                 ("event_table_id", event_table_id),
                 ("foreign_key_id", foreign_key_id),
                 ("source_column_id", source_column),
+                (
+                    "source_semantic_role",
+                    None
+                    if not source_column or semantic_schema is None
+                    else semantic_schema.column_role(source_column).value,
+                ),
                 ("state_id", state_id),
             ),
         )
@@ -111,6 +132,7 @@ def sample_rule_plan(
     runtime: RuntimeContext,
     state_id: str | None = None,
     config: RuleProcessConfig | None = None,
+    semantic_schema: SemanticSchemaPlan | None = None,
 ) -> RulePlan:
     return RuleProcessSampler(config).sample(
         schema=schema,
@@ -119,6 +141,7 @@ def sample_rule_plan(
         foreign_key_id=foreign_key_id,
         runtime=runtime,
         state_id=state_id,
+        semantic_schema=semantic_schema,
     )
 
 

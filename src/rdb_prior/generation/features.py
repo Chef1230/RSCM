@@ -52,6 +52,11 @@ def generate_table_features(
         raise ValueError("instance plan lacks calendar interval")
     values: dict[str, np.ndarray] = {}
     mechanisms = {item.column_id: item for item in plan.column_mechanisms}
+    dag_enabled = any(
+        mechanism.family in {"linear", "cam", "mlp", "exogenous"}
+        and "time_weight" not in dict(mechanism.parameters)
+        for mechanism in mechanisms.values()
+    )
     dag_values = (
         execute_column_dag(
             schema=schema,
@@ -61,7 +66,7 @@ def generate_table_features(
             relations=relations,
             generated_tables=generated_tables,
         )
-        if plan.prior_family == "relational_scm"
+        if dag_enabled
         else {}
     )
 
@@ -92,7 +97,7 @@ def generate_table_features(
         elif (
             mechanism is not None
             and mechanism.family == "tree"
-            and plan.prior_family not in {"temporal_event", "rule_process"}
+            and not _tree_requires_temporal_context(mechanism)
         ):
             signal = _tree_feature_signal(
                 mechanism=mechanism,
@@ -147,6 +152,17 @@ def generate_table_features(
             long_tail_enabled=False,
         )
     return values
+
+
+def _tree_requires_temporal_context(mechanism: ColumnMechanismPlan) -> bool:
+    payload = dict(mechanism.parameters).get("forest")
+    if not isinstance(payload, Mapping):
+        return False
+    return any(
+        node.get("feature_ref") in {"state_0", "time", "history"}
+        for tree in payload.get("trees", ())
+        for node in tree.get("nodes", ())
+    )
 
 
 def _tree_feature_signal(

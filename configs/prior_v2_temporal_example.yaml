@@ -353,6 +353,11 @@ prior:
     posthoc_horizon_selection: false
     programs_per_database: 1
     max_materialization_attempts: 8
+    support_fraction: 0.70
+    min_support_rows: 8
+    min_query_rows: 4
+    min_total_rows: 12
+    min_class_count_per_split: 1
     cutoff_fraction_min: 0.25
     cutoff_fraction_max: 0.25
     horizon_fraction_min: 0.60

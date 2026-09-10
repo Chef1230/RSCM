@@ -46,6 +46,7 @@ from rdb_prior.priors.model import (
     PriorFamily,
     ProcessPriorKind,
     RelationPriorKind,
+    StateSpacePlan,
     TaskPolicyPlan,
     TemporalPriorKind,
 )
@@ -54,6 +55,7 @@ from rdb_prior.priors.planner import (
     PriorPlanner,
     PriorPlannerConfig,
     RelationTreeConfig,
+    TemporalStateConfig,
 )
 from rdb_prior.runtime import RuntimeContext
 from rdb_prior.evaluation import (
@@ -62,6 +64,7 @@ from rdb_prior.evaluation import (
     summarize_prior_experiment,
 )
 from rdb_prior.schema.domain_prototypes import sample_semantic_schema
+from rdb_prior.schema.semantics import complete_semantic_schema
 from rdb_prior.schema.semantics import (
     SemanticNodePlan,
     SemanticSchemaPlan,
@@ -283,6 +286,167 @@ class PriorFamilyTests(unittest.TestCase):
                 positive_rate_min=1.0,
                 positive_rate_max=1.0,
             )
+        )
+
+    def test_temporal_state_is_unique_per_entity_across_event_motifs(self) -> None:
+        runtime = RuntimeContext(917).for_sample("multi_event_state")
+        blueprint = BlueprintSampler(
+            BlueprintSamplerConfig(
+                min_tables=4,
+                max_tables=4,
+                min_motif_occurrences=3,
+                max_motif_occurrences=3,
+                max_extra_edges=0,
+                background_attachment_probability=0.0,
+                motif_weights=(("entity_event", 1.0),),
+            )
+        ).sample("multi_event_state", runtime)
+        schema = PhysicalSchemaCompiler().compile(
+            blueprint,
+            "multi_event_state",
+            runtime,
+        )
+        prior = PriorPlanner(
+            PriorPlannerConfig(
+                database_family_weights=((PriorFamily.TEMPORAL_EVENT, 1.0),),
+                temporal_state=TemporalStateConfig(
+                    enabled=True,
+                    state_space=StateSpacePlan(values=("active", "inactive")),
+                ),
+            )
+        ).plan(
+            blueprint=blueprint,
+            physical_schema=schema,
+            semantic_schema=sample_semantic_schema(
+                schema,
+                runtime.child("semantic"),
+            ),
+            runtime=runtime.child("prior"),
+        )
+
+        temporal_bundles = tuple(
+            item
+            for item in prior.motif_bundles
+            if item.family is PriorFamily.TEMPORAL_EVENT
+        )
+        self.assertGreaterEqual(len(temporal_bundles), 2)
+        self.assertEqual(1, len(prior.shared_states))
+        self.assertEqual(1, len(prior.temporal_states))
+        self.assertEqual(
+            prior.shared_states[0].owner_table_id,
+            prior.temporal_states[0].owner_table_id,
+        )
+        self.assertTrue(
+            all(
+                prior.shared_states[0].state_id in bundle.shared_state_ids
+                for bundle in temporal_bundles
+            )
+        )
+
+    def test_state_owner_validation_requires_unique_entity_owner(self) -> None:
+        _runtime, schema, _prior, plan, _database = self._temporal_fixture()
+        state = plan.shared_states[0]
+        duplicate = replace(state, state_id=f"{state.state_id}_duplicate")
+        duplicate_report = validate_instance_plan(
+            schema,
+            replace(
+                plan,
+                shared_states=(state, duplicate),
+                shared_state_ids=(state.state_id, duplicate.state_id),
+            ),
+        )
+        duplicate_codes = {issue.code for issue in duplicate_report.issues}
+        self.assertIn("duplicate_shared_state_owner", duplicate_codes)
+
+        event_table_id = next(
+            table.table_id
+            for table in schema.tables
+            if table.role is TableRole.EVENT
+        )
+        non_entity_report = validate_instance_plan(
+            schema,
+            replace(
+                plan,
+                shared_states=(replace(state, owner_table_id=event_table_id),),
+            ),
+        )
+        non_entity_codes = {issue.code for issue in non_entity_report.issues}
+        self.assertIn("shared_state_owner_role", non_entity_codes)
+
+    def test_semantic_roles_have_explicit_physical_column_bindings(self) -> None:
+        runtime, schema, _prior, _plan, _database = self._temporal_fixture()
+        logical = sample_semantic_schema(schema, runtime.child("logical-semantic"))
+        completed = complete_semantic_schema(logical, schema)
+        self.assertTrue(completed.columns)
+        self.assertEqual(
+            len(completed.columns),
+            len({item.semantic_column_id for item in completed.columns}),
+        )
+        self.assertTrue(
+            all(
+                item.physical_column_id == item.column_id
+                and item.semantic_column_id
+                for item in completed.columns
+            )
+        )
+
+    def test_composed_bundle_executes_tree_scm_temporal_and_rule(self) -> None:
+        runtime = RuntimeContext(614).for_sample("composed_execution")
+        blueprint = BlueprintSampler(
+            BlueprintSamplerConfig(
+                min_tables=3,
+                max_tables=3,
+                min_motif_occurrences=1,
+                max_motif_occurrences=1,
+                max_extra_edges=0,
+                background_attachment_probability=0.0,
+                motif_weights=(("entity_event", 1.0),),
+            )
+        ).sample("composed_execution", runtime)
+        schema = PhysicalSchemaCompiler().compile(
+            blueprint,
+            "composed_execution",
+            runtime,
+        )
+        prior = PriorPlanner(
+            PriorPlannerConfig(
+                composition=PriorCompositionConfig(
+                    attribute=AttributePriorKind.TREE,
+                    relation=RelationPriorKind.SCM,
+                    temporal=TemporalPriorKind.SEASONAL,
+                    process=ProcessPriorKind.RULE,
+                )
+            )
+        ).plan(
+            blueprint=blueprint,
+            physical_schema=schema,
+            semantic_schema=sample_semantic_schema(schema, runtime.child("semantic")),
+            runtime=runtime.child("prior"),
+        )
+        plan = InstancePlanner(
+            InstancePlannerConfig(
+                entity_rows_min=24,
+                entity_rows_max=24,
+                lookup_rows_min=4,
+                lookup_rows_max=4,
+                max_rows_per_table=256,
+            )
+        ).plan(
+            sample_id="composed_execution",
+            schema=schema,
+            runtime=runtime.child("instance"),
+            prior_plan=prior,
+        )
+        self.assertEqual(PriorFamily.RULE_PROCESS, prior.family)
+        self.assertTrue(any(item.family.startswith("scm_") for item in plan.relations))
+        self.assertTrue(any(item.family == "tree" for item in plan.column_mechanisms))
+        materialized = DatabaseGenerator().materialize(schema=schema, plan=plan)
+        self.assertTrue(
+            validate_database_instance(
+                schema,
+                materialized.plan,
+                materialized.database,
+            ).is_valid
         )
 
     def test_static_state_signal_drives_realized_event_counts(self) -> None:

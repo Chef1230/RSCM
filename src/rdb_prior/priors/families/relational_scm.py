@@ -100,7 +100,7 @@ def bind_relational_scm_plan(
                 (str(key), value)
                 for key, value in payload.items()
                 if key not in {"table_id", "parent_table_id", "family"}
-            ),
+            ) + (("population_source", "relational_scm"),),
         )
     return replace(
         plan,

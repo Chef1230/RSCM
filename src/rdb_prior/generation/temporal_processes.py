@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+import heapq
 
 import numpy as np
 
@@ -42,7 +43,14 @@ def resolve_temporal_population_plan(
     """
     if plan.temporal_state_plans:
         return _resolve_stateful_temporal_population_plan(schema, plan, entity_database)
-    if plan.prior_family not in {"temporal_event", "rule_process"} or not plan.population_mechanisms:
+    if not plan.population_mechanisms or not (
+        any(
+            dict(item.parameters).get("population_source") == "temporal_event"
+            for item in plan.population_mechanisms
+        )
+        or any(item.temporal_state_ids for item in plan.temporal_processes)
+        or plan.prior_family in {"temporal_event", "rule_process"}
+    ):
         return plan
     shared_states = SharedStateRegistry.from_plan(plan)
     table_plans = {item.table_id: item for item in plan.tables}
@@ -177,7 +185,14 @@ def _apply_stateless_temporal_event_processes(
     database: DatabaseInstance,
 ) -> DatabaseInstance:
     """Replace P1 Event FK/time/feature values with one shared process."""
-    if plan.prior_family not in {"temporal_event", "rule_process"} or not plan.population_mechanisms:
+    if not plan.population_mechanisms or not (
+        any(
+            dict(item.parameters).get("population_source") == "temporal_event"
+            for item in plan.population_mechanisms
+        )
+        or any(item.temporal_state_ids for item in plan.temporal_processes)
+        or plan.prior_family in {"temporal_event", "rule_process"}
+    ):
         return database
     shared_states = SharedStateRegistry.from_plan(plan)
     tables = {item.table_id: item for item in database.tables}
@@ -546,6 +561,421 @@ class _StatefulEventSchedule:
     trajectories: tuple[StateTrajectory, ...]
 
 
+def _stateful_event_schedules(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+    database: DatabaseInstance,
+    *,
+    mechanisms: tuple,
+) -> dict[str, _StatefulEventSchedule]:
+    """Generate all Event channels from one Entity-owned state trajectory.
+
+    Channels are grouped by ``temporal_state_id`` and share a per-Entity
+    priority queue.  The queue key is ``(time, kind, channel, sequence)``;
+    this gives deterministic same-timestamp ordering while allowing any
+    channel's emission to advance the common state machine.
+    """
+    process_by_table = {item.table_id: item for item in plan.temporal_processes}
+    grouped: dict[str, list[tuple[object, object]]] = {}
+    for mechanism in mechanisms:
+        process = process_by_table.get(mechanism.table_id)
+        if (
+            mechanism.family != "negative_binomial"
+            or mechanism.parent_table_id is None
+            or process is None
+            or not process.temporal_state_ids
+        ):
+            continue
+        grouped.setdefault(process.temporal_state_ids[0], []).append(
+            (mechanism, process)
+        )
+
+    schedules: dict[str, _StatefulEventSchedule] = {}
+    for temporal_state_id, channels in sorted(grouped.items()):
+        temporal_plan = next(
+            item
+            for item in plan.temporal_state_plans
+            if item.state_id == temporal_state_id
+        )
+        owner_id = temporal_plan.owner_table_id
+        if any(item.parent_table_id != owner_id for item, _process in channels):
+            raise ValueError("all Event channels for a temporal state must share its Entity owner")
+        schedules.update(
+            _stateful_event_schedule_group(
+                schema,
+                plan,
+                database,
+                temporal_plan,
+                tuple(sorted(channels, key=lambda item: item[0].table_id)),
+            )
+        )
+    return schedules
+
+
+def _stateful_event_schedule_group(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+    database: DatabaseInstance,
+    temporal_plan,
+    channels: tuple[tuple[object, object], ...],
+) -> dict[str, _StatefulEventSchedule]:
+    if plan.calendar_start_seconds is None or plan.calendar_end_seconds is None:
+        raise ValueError("temporal state process requires a calendar")
+    schedules: dict[str, _StatefulEventSchedule] = {}
+    start = plan.calendar_start_seconds
+    end = plan.calendar_end_seconds
+    span = float(end - start)
+    static = SharedStateRegistry.from_plan(plan).state(temporal_plan.shared_state_id)
+    entity = database.table(temporal_plan.owner_table_id)
+    if len(static) != entity.row_count:
+        raise ValueError("static state must align with temporal-state owner")
+    state_to_index = {
+        value: index for index, value in enumerate(temporal_plan.state_space.values)
+    }
+    channel_data: dict[str, dict[str, object]] = {}
+    for mechanism, process in channels:
+        parameters = dict(mechanism.parameters)
+        baseline = float(parameters["baseline_intensity"])
+        base_rate = max(baseline / span, 1.0 / max(span * 100.0, 1.0))
+        score_rng = np.random.Generator(
+            np.random.PCG64DXSM(
+                temporal_plan.seed ^ _stable_channel_seed(mechanism.table_id)
+            )
+        )
+        attribute_score = _entity_attribute_score(
+            schema,
+            temporal_plan.owner_table_id,
+            entity.columns,
+            score_rng,
+        )
+        forest_payload = parameters.get("event_intensity_forest")
+        if isinstance(forest_payload, Mapping):
+            intensity_score = _standardize(
+                _tree_intensity_score(
+                    ForestPlan.from_dict(forest_payload),
+                    schema,
+                    temporal_plan.owner_table_id,
+                    entity.columns,
+                    static,
+                )
+            )
+        else:
+            intensity_score = np.zeros(entity.row_count, dtype=np.float64)
+        rule_effect = _rule_effect_for_entities(
+            parameters.get("rule_plan"),
+            database,
+            temporal_plan.shared_state_id,
+            static,
+            entity.row_count,
+        )
+        channel_data[mechanism.table_id] = {
+            "mechanism": mechanism,
+            "process": process,
+            "parameters": parameters,
+            "base_rate": base_rate,
+            "attribute_score": attribute_score,
+            "intensity_score": intensity_score,
+            "rule_effect": rule_effect,
+            "assignments": [],
+            "times": [],
+            "ordinals": [],
+            "state_indices": [],
+            "history": [],
+        }
+
+    trajectories: list[StateTrajectory] = []
+    for entity_index, z in enumerate(static):
+        entity_seed = temporal_plan.seed ^ (entity_index + 1)
+        initial_rng = np.random.Generator(np.random.PCG64DXSM(entity_seed))
+        initial = _initial_state(temporal_plan, z, initial_rng)
+        trajectory = StateTrajectory(
+            calendar_start=start,
+            calendar_end=end,
+            initial_state=initial,
+            state_space=temporal_plan.state_space,
+        )
+        trajectories.append(trajectory)
+        queue: list[tuple[float, int, str, int, str, int]] = []
+        channel_rngs: dict[str, np.random.Generator] = {}
+        channel_history: dict[str, int] = {}
+        channel_sequence: dict[str, int] = {}
+        for channel_index, (mechanism, process) in enumerate(channels):
+            channel_seed = _stable_channel_seed(mechanism.table_id)
+            channel_rng = (
+                initial_rng
+                if channel_index == 0
+                else np.random.Generator(np.random.PCG64DXSM(entity_seed ^ channel_seed))
+            )
+            channel_rngs[mechanism.table_id] = channel_rng
+            channel_history[mechanism.table_id] = 0
+            channel_sequence[mechanism.table_id] = 0
+            current_state = initial
+            rate = _channel_event_rate(
+                temporal_plan,
+                current_state,
+                z,
+                entity_index,
+                channel_data[mechanism.table_id],
+            )
+            wait = _stateful_wait(
+                channel_rng,
+                process,
+                z,
+                rate,
+                float(start),
+                start,
+                end,
+            )
+            heapq.heappush(
+                queue,
+                (start + wait, 0, mechanism.table_id, channel_sequence[mechanism.table_id], "event", channel_index),
+            )
+            channel_sequence[mechanism.table_id] += 1
+
+        transition_rng = channel_rngs[channels[0][0].table_id]
+        transition_data = channel_data[channels[0][0].table_id]
+        transition_version = 0
+        transition_deadline: float | None = None
+        if temporal_plan.transition.clock is not TransitionClock.EVENT_DRIVEN:
+            transition_rate = _transition_rate(
+                temporal_plan,
+                initial,
+                z,
+                entity_index,
+                transition_data,
+            )
+            transition_deadline = float(
+                start + transition_rng.exponential(1.0 / max(transition_rate, 1e-12))
+            )
+            heapq.heappush(
+                queue,
+                (transition_deadline, 1, "", transition_version, "transition", -1),
+            )
+
+        next_ordinal: dict[int, int] = {}
+        last_transition: tuple[int, int] | None = None
+        steps = 0
+        while queue and not trajectory.is_terminal:
+            event_time, kind, channel_id, sequence, event_kind, channel_index = heapq.heappop(queue)
+            if event_kind == "transition" and sequence != transition_version:
+                continue
+            if event_time > end:
+                break
+            timestamp = _calendar_time(event_time, start, end)
+            if event_kind == "transition":
+                ordinal = _duration_transition_ordinal(
+                    timestamp,
+                    next_ordinal,
+                    last_transition,
+                )
+                state = trajectory.state_after(timestamp, ordinal)
+                target = _next_state(temporal_plan, state, z, transition_rng)
+                override = _first_state_override(channel_data, entity_index, state_to_index)
+                if override is not None:
+                    target = override
+                trajectory.transition(timestamp=timestamp, ordinal=ordinal, state=target)
+                last_transition = (timestamp, ordinal)
+                transition_version += 1
+                if not trajectory.is_terminal:
+                    state = trajectory.state_after(timestamp, ordinal)
+                    transition_rate = _transition_rate(
+                        temporal_plan,
+                        state,
+                        z,
+                        entity_index,
+                        transition_data,
+                    )
+                    transition_deadline = float(
+                        event_time
+                        + transition_rng.exponential(1.0 / max(transition_rate, 1e-12))
+                    )
+                    heapq.heappush(
+                        queue,
+                        (transition_deadline, 1, "", transition_version, "transition", -1),
+                    )
+                steps += 1
+                continue
+
+            data = channel_data[channel_id]
+            ordinal = next_ordinal.get(timestamp, 0)
+            next_ordinal[timestamp] = ordinal + 1
+            state = trajectory.state_before(timestamp, ordinal)
+            payload = data["assignments"]
+            assert isinstance(payload, list)
+            payload.append(entity_index)
+            for key, value in (
+                ("times", timestamp),
+                ("ordinals", ordinal),
+                ("state_indices", state_to_index[state]),
+                ("history", float(channel_history[channel_id])),
+            ):
+                target = data[key]
+                assert isinstance(target, list)
+                target.append(value)
+            channel_history[channel_id] += 1
+            current_state = state
+            if temporal_plan.transition.clock in {
+                TransitionClock.EVENT_DRIVEN,
+                TransitionClock.HYBRID,
+            }:
+                target_state = _next_state(
+                    temporal_plan,
+                    current_state,
+                    z,
+                    channel_rngs[channel_id],
+                )
+                effect = data["rule_effect"]
+                if effect is not None:
+                    override = effect.state_overrides[entity_index]
+                    if override in state_to_index:
+                        target_state = str(override)
+                trajectory.transition(
+                    timestamp=timestamp,
+                    ordinal=ordinal,
+                    state=target_state,
+                )
+                last_transition = (timestamp, ordinal)
+                if temporal_plan.transition.clock is TransitionClock.HYBRID:
+                    transition_version += 1
+                    state = target_state
+                    transition_rate = _transition_rate(
+                        temporal_plan,
+                        state,
+                        z,
+                        entity_index,
+                        transition_data,
+                    )
+                    transition_deadline = float(
+                        event_time
+                        + transition_rng.exponential(1.0 / max(transition_rate, 1e-12))
+                    )
+                    heapq.heappush(
+                        queue,
+                        (transition_deadline, 1, "", transition_version, "transition", -1),
+                    )
+            steps += 1
+            if steps >= 8192:
+                raise ValueError("temporal state process exceeded transition limit")
+            if trajectory.is_terminal:
+                break
+            state = trajectory.state_after(timestamp, ordinal)
+            rate = _channel_event_rate(
+                temporal_plan,
+                state,
+                z,
+                entity_index,
+                data,
+            )
+            process = data["process"]
+            assert process is not None
+            rng = channel_rngs[channel_id]
+            wait = _stateful_wait(
+                rng,
+                process,
+                z,
+                rate,
+                event_time,
+                start,
+                end,
+            )
+            channel_sequence[channel_id] += 1
+            heapq.heappush(
+                queue,
+                (event_time + wait, 0, channel_id, channel_sequence[channel_id], "event", channel_index),
+            )
+
+    for table_id, data in channel_data.items():
+        schedules[table_id] = _StatefulEventSchedule(
+            assignments=np.asarray(data["assignments"], dtype=np.int64),
+            times=np.asarray(data["times"], dtype=np.int64),
+            ordinals=np.asarray(data["ordinals"], dtype=np.int64),
+            state_indices=np.asarray(data["state_indices"], dtype=np.int64),
+            history=np.asarray(data["history"], dtype=np.float64),
+            trajectories=tuple(trajectories),
+        )
+    return schedules
+
+
+def _stateful_event_schedule(
+    schema: PhysicalSchema,
+    plan: InstancePlan,
+    database: DatabaseInstance,
+    mechanism,
+    process,
+) -> _StatefulEventSchedule:
+    """Compatibility view over the unified multi-channel scheduler."""
+    schedule = _stateful_event_schedules(
+        schema,
+        plan,
+        database,
+        mechanisms=tuple(plan.population_mechanisms),
+    ).get(mechanism.table_id)
+    if schedule is None:
+        raise ValueError(f"no shared temporal schedule for {mechanism.table_id}")
+    return schedule
+
+
+def _stable_channel_seed(table_id: str) -> int:
+    return sum((index + 1) * ord(char) for index, char in enumerate(table_id))
+
+
+def _channel_event_rate(
+    temporal_plan,
+    state: str,
+    z: np.ndarray,
+    entity_index: int,
+    data: dict[str, object],
+) -> float:
+    base_rate = float(data["base_rate"])
+    attribute_score = np.asarray(data["attribute_score"])[entity_index]
+    intensity_score = np.asarray(data["intensity_score"])[entity_index]
+    effect = data["rule_effect"]
+    multiplier = float(effect.intensity_multiplier[entity_index]) if effect is not None else 1.0
+    addition = float(effect.intensity_addition[entity_index]) if effect is not None else 0.0
+    state_index = temporal_plan.state_space.values.index(state)
+    return _state_rate(
+        temporal_plan,
+        state_index,
+        z,
+        float(attribute_score),
+        base_rate * float(np.exp(0.55 * np.clip(intensity_score, -5.0, 5.0))) * multiplier + addition,
+    )
+
+
+def _transition_rate(
+    temporal_plan,
+    state: str,
+    z: np.ndarray,
+    entity_index: int,
+    data: dict[str, object],
+) -> float:
+    return _channel_event_rate(
+        temporal_plan,
+        state,
+        z,
+        entity_index,
+        data,
+    ) * float(
+        dict(temporal_plan.duration.parameters).get(
+            "transition_rate_multiplier", 1.0
+        )
+    )
+
+
+def _first_state_override(
+    channel_data: dict[str, dict[str, object]],
+    entity_index: int,
+    state_to_index: dict[str, int],
+) -> str | None:
+    for table_id in sorted(channel_data):
+        effect = channel_data[table_id]["rule_effect"]
+        if effect is not None:
+            override = effect.state_overrides[entity_index]
+            if override in state_to_index:
+                return str(override)
+    return None
+
+
 def _resolve_stateful_temporal_population_plan(
     schema: PhysicalSchema,
     plan: InstancePlan,
@@ -554,6 +984,12 @@ def _resolve_stateful_temporal_population_plan(
     table_plans = {item.table_id: item for item in plan.tables}
     process_by_table = {item.table_id: item for item in plan.temporal_processes}
     resolved = []
+    schedules = _stateful_event_schedules(
+        schema,
+        plan,
+        entity_database,
+        mechanisms=tuple(plan.population_mechanisms),
+    )
     for mechanism in plan.population_mechanisms:
         process = process_by_table.get(mechanism.table_id)
         if (
@@ -564,13 +1000,7 @@ def _resolve_stateful_temporal_population_plan(
         ):
             resolved.append(mechanism)
             continue
-        schedule = _stateful_event_schedule(
-            schema,
-            plan,
-            entity_database,
-            mechanism,
-            process,
-        )
+        schedule = schedules[mechanism.table_id]
         total = len(schedule.times)
         if total < 1:
             raise ValueError("temporal state process produced no events")
@@ -621,12 +1051,18 @@ def _apply_stateful_temporal_event_processes(
     plan: InstancePlan,
     database: DatabaseInstance,
 ) -> TemporalEventMaterialization:
-    if plan.prior_family not in {"temporal_event", "rule_process"}:
+    if not plan.temporal_state_plans:
         return TemporalEventMaterialization(database=database)
     tables = {item.table_id: item for item in database.tables}
     processes = {item.table_id: item for item in plan.temporal_processes}
     foreign_keys = {item.foreign_key_id: item for item in schema.foreign_keys}
     trajectories: dict[str, tuple[StateTrajectory, ...]] = {}
+    schedules = _stateful_event_schedules(
+        schema,
+        plan,
+        database,
+        mechanisms=tuple(plan.population_mechanisms),
+    )
     for mechanism in plan.population_mechanisms:
         process = processes.get(mechanism.table_id)
         if (
@@ -636,13 +1072,7 @@ def _apply_stateful_temporal_event_processes(
             or not process.temporal_state_ids
         ):
             continue
-        schedule = _stateful_event_schedule(
-            schema,
-            plan,
-            database,
-            mechanism,
-            process,
-        )
+        schedule = schedules[mechanism.table_id]
         event = tables[mechanism.table_id]
         if len(schedule.times) != event.row_count:
             raise ValueError("stateful event schedule does not match final population")
@@ -675,7 +1105,7 @@ def _apply_stateful_temporal_event_processes(
     )
 
 
-def _stateful_event_schedule(
+def _stateful_event_schedule_legacy(
     schema: PhysicalSchema,
     plan: InstancePlan,
     database: DatabaseInstance,

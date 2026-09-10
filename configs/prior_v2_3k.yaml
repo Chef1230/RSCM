@@ -5,8 +5,9 @@ config_version: 1
 seed: 42
 
 paths:
-  # Stage outputs are derived as schema/, instance/, task/, and rdbpfn/.
-  output_root: outputs/prior_v2_3k
+  # Keep the aborted large-population run intact for diagnosis.  The revised
+  # batch writes an independent schema/instance/task/export lineage here.
+  output_root: outputs/prior_v2_3k_v2_dfs1
 
 generation:
   # Stage 01: 3,000 schemas, then Stage 02 consumes all of them.
@@ -94,29 +95,34 @@ physical_design:
   feature_columns_by_role: null
 
 # Stage 02: bind every physical schema to an executable instance plan.
+#
+# This is a 3k-database batch, not a 3k-row-per-database run.  Fixed root
+# population keeps throughput and storage bounded.  In particular, the event
+# fanout floor must stay above one: relational-SCM materializes a new
+# state-conditioned child population and rejects it rather than truncating it
+# if it exceeds four times the planned child population.
 instance:
-  entity_rows_min: 48
-  entity_rows_max: 48
+  entity_rows_min: 100
+  entity_rows_max: 2000
   entity_rows_distribution: loguniform
-  entity_rows_median: 256
+  entity_rows_median: 500
   entity_rows_log_sigma: 0.8
+
   lookup_rows_min: 4
   lookup_rows_max: 4
   lookup_rows_distribution: uniform
-  event_fanout_min: 0.75
+
+  event_fanout_min: 1.25
   event_fanout_max: 4.0
   bridge_rows_factor_min: 0.5
   bridge_rows_factor_max: 2.0
-  detail_fanout_min: 0.75
+  detail_fanout_min: 1.0
   detail_fanout_max: 4.0
   entity_child_factor_min: 0.5
   entity_child_factor_max: 1.5
 
-  # Global per-database size multiplier. uniform keeps sizes tightly clustered
-  # around the base row counts; lognormal adds heavy inter-database variance.
   population_scale_distribution: uniform
   population_scale_log_sigma: 0.8
-
   max_rows_per_table: 256
 
   # One shared latent registry drives both FK choice and feature SCMs.
@@ -250,7 +256,7 @@ instance_generation:
   shard_id: 0
   num_shards: 1
   # Process workers; one worker owns one database generation job.
-  num_workers: 8
+  num_workers: 32
   progress_every: 25
   overwrite: false
   project_version: instance-pipeline-v1
@@ -268,8 +274,8 @@ task:
     temporal_relational_aggregate: 0.20
 
   support_fraction: 0.70
-  min_support_rows: 8
-  min_query_rows: 4
+  min_support_rows: 32
+  min_query_rows: 16
   min_class_count_per_split: 1
   max_classification_categories: 12
 
@@ -289,7 +295,7 @@ task_generation:
   start_index: 0
   shard_id: 0
   num_shards: 1
-  num_workers: 8
+  num_workers: 48
   progress_every: 25
   overwrite: false
   project_version: task-pipeline-v1
@@ -304,7 +310,7 @@ rdbpfn_export:
   min_validation_rows: 8
   compress: true
   progress_every: 25
-  overwrite: false
+  overwrite: true
   project_version: rdbpfn-export-v1
   # Build H5 from DFS-processed task features after DBB export.
   h5_enabled: true
@@ -314,7 +320,7 @@ rdbpfn_export:
   h5_run_dfs: true
   dfs_depth: 1
   # Number of DBB datasets processed concurrently by the RDBPFN DFS script.
-  dfs_jobs: 4
+  dfs_jobs: 64
   h5_total_rows: 600
   h5_max_columns: 60
   h5_seed: 42
@@ -378,9 +384,13 @@ prior:
       scm_cpt: 0.15
       scm_community: 0.15
     population_mechanisms:
-      poisson: 0.20
-      negative_binomial: 0.70
-      zero_inflated_negative_binomial: 0.10
+      # Temporal-event bundles retain NB variation.  Relational-SCM uses a
+      # low-tail conditional count model for this bounded batch, because
+      # its executor rejects an over-limit realization; every non-legacy plan
+      # now has bounded materialization-only retries.
+      poisson: 1.0
+      negative_binomial: 0.0
+      zero_inflated_negative_binomial: 0.0
 
   nuisance:
     enabled: false
