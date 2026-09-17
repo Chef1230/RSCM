@@ -409,10 +409,19 @@ class TaskProgramPlanner:
         ]
         if not family_candidates:
             raise ValueError("temporal prior has no compatible task program family")
+        family_rng = runtime.numpy_rng("task-program", "family-selection")
+        family_selection_indices: list[int] = []
+        while len(family_selection_indices) < policy.programs_per_database:
+            family_selection_indices.extend(
+                int(index) for index in family_rng.permutation(len(family_candidates))
+            )
+        selected_families = tuple(
+            family_candidates[index]
+            for index in family_selection_indices[:policy.programs_per_database]
+        )
         span = end - start
         programs: list[TaskProgramPlan] = []
-        for index in range(policy.programs_per_database):
-            family = family_candidates[index % len(family_candidates)]
+        for index, family in enumerate(selected_families):
             compatible = [
                 bundle for bundle in temporal_bundles
                 if (

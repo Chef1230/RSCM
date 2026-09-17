@@ -288,6 +288,35 @@ class PriorFamilyTests(unittest.TestCase):
             )
         )
 
+    def test_task_program_families_vary_per_database_seed(self) -> None:
+        _runtime, schema, prior, plan, _database = self._temporal_fixture()
+        policy = replace(prior.task_policy, programs_per_database=2)
+        prior = replace(
+            prior,
+            task_policy=policy,
+            composition=replace(prior.composition, task_policy=policy),
+        )
+
+        def selected_families(seed: int) -> tuple[str, ...]:
+            runtime = RuntimeContext(seed).for_sample(
+                f"task_family_{seed}"
+            ).child("task-program")
+            programs = TaskProgramPlanner().plan(
+                schema=schema,
+                instance_plan=plan,
+                prior_plan=prior,
+                runtime=runtime,
+            )
+            return tuple(program.family for program in programs)
+
+        selections = [selected_families(seed) for seed in range(8)]
+        self.assertTrue(all(len(set(families)) == 2 for families in selections))
+        self.assertEqual(selections[3], selected_families(3))
+        self.assertGreater(
+            len({family for selection in selections for family in selection}),
+            2,
+        )
+
     def test_temporal_state_is_unique_per_entity_across_event_motifs(self) -> None:
         runtime = RuntimeContext(917).for_sample("multi_event_state")
         blueprint = BlueprintSampler(
